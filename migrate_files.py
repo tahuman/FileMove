@@ -15,6 +15,7 @@
     python migrate_files.py /data/old /data/new --dry-run
     python migrate_files.py /data/old /data/new --ext pdf,xlsx --since 30d
     python migrate_files.py /data/old /data/new --move
+    python migrate_files.py /data/old/report.pdf /data/new   # 単一ファイル -> /data/new/report.pdf
 """
 
 from __future__ import annotations
@@ -145,15 +146,26 @@ def transfer_file(src_file: Path, dest: Path, *,
 
 # ================================================================ 台帳（再開用）
 
+def _root_id(path: Path) -> str:
+    """台帳で移行元／移行先を識別するための文字列（Windows では大文字小文字を同一視）。"""
+    return os.path.normcase(str(Path(path).resolve()))
+
+
 class Ledger:
     """処理結果を 1 行 1 レコードの JSONL に追記する。再実行時の再開判定に使う。
 
     path=None なら記録はメモリ上だけ（ドライランや単発実行向け）。
+
+    レコードには移行元・移行先のルート（src_root / dst_root）を記録し、
+    bind() で指定した組み合わせのレコードだけを参照する。これにより同じ台帳
+    ファイルを別の移行で使い回しても、相対パスが同じだけの別ファイルを
+    処理済みと誤判定しない。ルートを持たない旧形式のレコードは参照しない。
     """
 
     def __init__(self, path: Path | None = None):
         self.path = Path(path) if path else None
-        self.records: dict[str, dict] = {}
+        self.records: dict[tuple[str, str, str], dict] = {}
+        self.scope: tuple[str, str] = ("", "")
         self._fh = None
 
         if self.path and self.path.exists():
@@ -170,18 +182,28 @@ class Ledger:
                     continue
                 try:
                     rec = json.loads(line)
-                    self.records[rec["path"]] = rec
-                except (json.JSONDecodeError, KeyError, TypeError):
+                    key = (rec.get("src_root", ""), rec.get("dst_root", ""), rec["path"])
+                    self.records[key] = rec
+                except (json.JSONDecodeError, KeyError, TypeError, AttributeError):
                     continue  # 壊れた行は無視して読み進める
+
+    def bind(self, src: Path, dst: Path) -> None:
+        """以降の判定・記録を、この移行元→移行先の組み合わせに限定する。"""
+        self.scope = (_root_id(src), _root_id(dst))
+
+    def _key(self, rel: str) -> tuple[str, str, str]:
+        return (*self.scope, rel)
 
     def is_done(self, rel: str) -> bool:
         """成功したものだけ処理済みとみなす。failed は次回に再試行させる。"""
-        return self.records.get(rel, {}).get("status") == "done"
+        return self.records.get(self._key(rel), {}).get("status") == "done"
 
     def record(self, rel: str, status: str, **extra) -> None:
         rec = {"path": rel, "status": status,
                "ts": datetime.now().isoformat(timespec="seconds"), **extra}
-        self.records[rel] = rec
+        if any(self.scope):
+            rec["src_root"], rec["dst_root"] = self.scope
+        self.records[self._key(rel)] = rec
         if self._fh:
             self._fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             self._fh.flush()  # 強制終了されても直前までの結果は残る
@@ -226,9 +248,22 @@ class FileFilter:
 
 def collect_files(src: Path, dst: Path, filt: FileFilter,
                   log: logging.Logger | None = None) -> list[Path]:
-    """条件に合うファイルを集めて、安定した順序で返す。"""
+    """条件に合うファイルを集めて、安定した順序で返す。
+
+    src がファイルの場合は、そのファイル 1 件だけを同じ条件で判定する。
+    """
     log = log or LOGGER
     src, dst = Path(src), Path(dst)
+    if src.is_file():
+        if filt.excluded(src.name, src.name):
+            return []
+        try:
+            st = src.stat()
+        except OSError as e:
+            log.warning("情報を取得できないためスキップ: %s (%s)", src.name, e)
+            return []
+        return [src] if filt.accepts(src, st) else []
+
     dst_resolved = dst.resolve()
 
     targets: list[Path] = []
@@ -283,6 +318,7 @@ class ProgressEvent:
 class MigrationResult:
     copied: int = 0
     skipped: int = 0
+    already_done: int = 0   # skipped のうち、台帳で処理済みだったもの
     failed: int = 0
     bytes_transferred: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
@@ -314,6 +350,8 @@ def run_migration(src, dst, *,
     ledger = ledger if ledger is not None else Ledger(None)
     src, dst = Path(src), Path(dst)
     emit = progress or (lambda ev: None)
+    ledger.bind(src, dst)
+    base = src.parent if src.is_file() else src  # 単一ファイルなら dst/<ファイル名> に送る
 
     targets = collect_files(src, dst, filt, log=log)
     total = len(targets)
@@ -325,7 +363,7 @@ def run_migration(src, dst, *,
     started = time.time()
 
     for i, f in enumerate(targets, 1):
-        rel = f.relative_to(src).as_posix()
+        rel = f.relative_to(base).as_posix()
 
         if should_cancel is not None and should_cancel():
             result.cancelled = True
@@ -334,6 +372,7 @@ def run_migration(src, dst, *,
 
         if ledger.is_done(rel):
             result.skipped += 1
+            result.already_done += 1
             log.debug("[%d/%d] 済: %s", i, total, rel)
             emit(ProgressEvent("skipped", i, total, rel))
             continue
@@ -390,7 +429,8 @@ def setup_logging(log_path: Path | None, verbose: bool) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="ファイル移行バッチ（検証・再開・ドライラン対応）")
-    p.add_argument("src", type=Path, help="移行元ディレクトリ")
+    p.add_argument("src", type=Path,
+                   help="移行元ディレクトリ、またはファイル（ファイルなら移行先直下に送る）")
     p.add_argument("dst", type=Path, help="移行先ディレクトリ")
     p.add_argument("--move", action="store_true", help="検証成功後に移行元を削除する")
     p.add_argument("--dry-run", action="store_true", help="書き込まずに対象だけ表示する")
@@ -415,10 +455,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.log, args.verbose)
 
-    if not args.src.is_dir():
+    if not (args.src.is_dir() or args.src.is_file()):
         LOGGER.error("移行元が見つかりません: %s", args.src)
         return 2
-    if args.src.resolve() == args.dst.resolve():
+    if args.dst.exists() and not args.dst.is_dir():
+        LOGGER.error("移行先がディレクトリではありません: %s", args.dst)
+        return 2
+    # 単一ファイルの場合は、そのファイルがあるディレクトリを移行先にすると自分自身に転送してしまう
+    src_dir = args.src if args.src.is_dir() else args.src.parent
+    if src_dir.resolve() == args.dst.resolve():
         LOGGER.error("移行元と移行先が同じです")
         return 2
 
@@ -454,6 +499,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     LOGGER.info("-" * 60)
     LOGGER.info("完了: 成功 %d / スキップ %d / 失敗 %d",
                 result.copied, result.skipped, result.failed)
+    if result.already_done:
+        LOGGER.info("  うち台帳で処理済みとしてスキップ %d 件（最初からやり直すには --restart）",
+                    result.already_done)
     LOGGER.info("転送量 %s / 所要 %.1f秒", human(result.bytes_transferred), result.elapsed)
     for rel, err in result.failures:
         LOGGER.info("  - 失敗: %s: %s", rel, err)
