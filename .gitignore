@@ -219,3 +219,6 @@ __marimo__/
 
 # テストデータ生成物（testdata/make_testdata.py で再生成）
 testdata/work/
+
+# デモの作業フォルダ（demo/demo.py で再生成）
+demo/work/

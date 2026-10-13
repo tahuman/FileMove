@@ -7,6 +7,15 @@ python testdata/make_testdata.py
 ```
 
 `testdata/work/` に `src/`・`dst/`・`ledger_partial.jsonl` が作られる（既存は消して作り直す）。
+
+**全シナリオの自動実行**（データの作り直しも含めて自動で行い、PASS/FAIL を表示）:
+
+```
+python testdata/run_scenarios.py          # 全件
+python testdata/run_scenarios.py M1 S13   # 指定したものだけ
+```
+
+以下の表は手で確認するときの手順と期待結果。`run_scenarios.py` の内容と一致させておくこと。
 **書き込みを伴うシナリオは、毎回この生成からやり直すこと**（dst や台帳が前の実行で変わるため）。
 
 以下のコマンドは共通で `W=testdata/work`、ログ・台帳はリポジトリを汚さないよう
@@ -88,6 +97,29 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | S14 | 移行先に既存の**ファイル**を指定 | 「移行先がディレクトリではありません」/ exit 2 |
 | S15 | 存在しないファイルを指定 | 「移行元が見つかりません」/ exit 2 |
 | S16 | `docs/` に移動して相対パス `"meeting notes.txt"` を指定 | 成功 1 |
+
+## 複数指定
+
+`SRC [SRC ...] DST` の形で、最後の引数が移行先。ディレクトリ・ファイル・ワイルドカードを混ぜて指定できる。
+
+| # | 移行元（→ 移行先は `$W/out`） | 期待結果 |
+|---|---|---|
+| M1 | `docs/report_2026.PDF` と `data/sales.csv` | 成功 2。out 直下に 2 ファイル |
+| M2 | M1 を再実行 | スキップ 2（台帳で処理済み） |
+| M3 | `"docs/report_*"`（ワイルドカード。Windows でもプログラム側で展開） | 成功 2 |
+| M4 | `docs`（ディレクトリ）と `data/sales.csv` | 成功 5（docs の中身 4 ＋ 1） |
+| M5 | `docs`, `docs/meeting notes.txt`, `docs` | 成功 4（重複は 1 回だけ） |
+| M6 | `src/conflict/same.txt` と `dst/conflict/same.txt`（同名） | 実行前に「同じ名前になるファイルが 1 組」と警告。先に指定した方が成功、後はスキップ |
+| M7 | M6 に `--on-exists rename` | 成功 2。`same.txt` と `same_1.txt` |
+| M6d | M6 に `--dry-run` | M6 と同じく成功 1・スキップ 1（ドライランでも先に置く予定のファイルを既存として扱う） |
+| M7d | M7 に `--dry-run` | 成功 2、2 件目の行き先が `same_1.txt` と表示される |
+| M8 | `data/sales.csv` と存在しない `nope.txt` | 「移行元が見つかりません: …nope.txt」/ exit 2。何もコピーされない |
+| M9 | `"docs/*.zzz"`（一致なし） | 「一致するものがありません」/ exit 2 |
+| M10 | M1 に `--move` | 成功 2。移行元 2 件とも消える |
+| M11 | M4 に `--dry-run` | 成功 5 と表示、out は作られない |
+| M12 | M1 に `--ext pdf` | 成功 1 |
+| M13 | 引数が 1 つだけ | 使い方エラー / exit 2 |
+| M14 | 移行先を `src/docs` にして `docs/report_2026.PDF` を含める | 「移行元と移行先が同じです」/ exit 2 |
 
 ## このデータでは確認できないもの
 

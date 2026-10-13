@@ -16,12 +16,14 @@
     python migrate_files.py /data/old /data/new --ext pdf,xlsx --since 30d
     python migrate_files.py /data/old /data/new --move
     python migrate_files.py /data/old/report.pdf /data/new   # 単一ファイル -> /data/new/report.pdf
+    python migrate_files.py a/x.pdf b/y.xlsx "c/*.txt" /data/new  # 複数指定（最後が移行先）
 """
 
 from __future__ import annotations
 
 import argparse
 import fnmatch
+import glob
 import hashlib
 import json
 import logging
@@ -92,9 +94,14 @@ def sha256_of(path: Path) -> str:
 
 # ================================================================ 移行先の決定
 
-def resolve_destination(dest: Path, policy: str) -> Path | None:
-    """同名ファイルがある場合の移行先を決める。None なら転送しない。"""
-    if not dest.exists():
+def resolve_destination(dest: Path, policy: str,
+                        exists: Callable[[Path], bool] = Path.exists) -> Path | None:
+    """同名ファイルがある場合の移行先を決める。None なら転送しない。
+
+    exists を差し替えると、ドライランで「この実行で先に置かれる予定のファイル」も
+    既存として扱える。
+    """
+    if not exists(dest):
         return dest
     if policy == "skip":
         return None
@@ -104,7 +111,7 @@ def resolve_destination(dest: Path, policy: str) -> Path | None:
     stem, suffix, i = dest.stem, dest.suffix, 1
     while True:
         cand = dest.with_name(f"{stem}_{i}{suffix}")
-        if not cand.exists():
+        if not exists(cand):
             return cand
         i += 1
 
@@ -330,6 +337,47 @@ class MigrationResult:
         return self.failed == 0 and not self.cancelled
 
 
+@dataclass
+class _Target:
+    root: Path   # 指定された移行元（ディレクトリまたはファイル）。台帳の識別に使う
+    path: Path   # 転送するファイル
+    rel: str     # 移行先からの相対パス
+    shown: str   # ログ表示用の名前
+
+
+def collect_targets(sources: Sequence[Path], dst: Path, filt: FileFilter,
+                    log: logging.Logger) -> list[_Target]:
+    """複数の移行元から転送対象を集める。
+
+    - ディレクトリは中身を構成ごと、ファイルは移行先直下に送る
+    - 同じファイルが複数の指定に含まれる場合は最初の 1 回だけ扱う
+    - 別の移行元から同じ移行先パスに来るものがあれば警告する（扱いは --on-exists に従う）
+    """
+    multi = len(sources) > 1
+    targets: list[_Target] = []
+    seen: set[str] = set()
+    for root in sources:
+        base = root.parent if root.is_file() else root
+        for f in collect_files(root, dst, filt, log=log):
+            key = _root_id(f)
+            if key in seen:
+                continue
+            seen.add(key)
+            rel = f.relative_to(base).as_posix()
+            targets.append(_Target(root, f, rel, str(f) if multi else rel))
+
+    by_rel: dict[str, list[_Target]] = {}
+    for t in targets:
+        by_rel.setdefault(os.path.normcase(t.rel), []).append(t)
+    dups = [ts for ts in by_rel.values() if len(ts) > 1]
+    if dups:
+        log.warning("移行先で同じ名前になるファイルが %d 組あります"
+                    "（--on-exists に従って処理。両方残すには --on-exists rename）", len(dups))
+        for ts in dups:
+            log.warning("  %s <- %s", ts[0].rel, ", ".join(str(t.path) for t in ts))
+    return targets
+
+
 def run_migration(src, dst, *,
                   filt: FileFilter | None = None,
                   move: bool = False,
@@ -342,28 +390,34 @@ def run_migration(src, dst, *,
                   should_cancel: Callable[[], bool] | None = None) -> MigrationResult:
     """移行を実行して結果を返す。表示や終了コードは呼び出し側に任せる。
 
+    src: 移行元のパス、またはパスのリスト（ディレクトリ・ファイル混在可）
     progress: 1 ファイルごとに ProgressEvent が渡される（GUI の進捗表示用）
     should_cancel: True を返すと、その時点で安全に中断する
     """
     log = log or LOGGER
     filt = filt or FileFilter()
     ledger = ledger if ledger is not None else Ledger(None)
-    src, dst = Path(src), Path(dst)
+    sources = [Path(src)] if isinstance(src, (str, os.PathLike)) else [Path(s) for s in src]
+    dst = Path(dst)
     emit = progress or (lambda ev: None)
-    ledger.bind(src, dst)
-    base = src.parent if src.is_file() else src  # 単一ファイルなら dst/<ファイル名> に送る
 
-    targets = collect_files(src, dst, filt, log=log)
+    targets = collect_targets(sources, dst, filt, log)
     total = len(targets)
     log.info("対象 %d 件 / %s", total,
-             human(sum(f.stat().st_size for f in targets if f.exists())))
+             human(sum(t.path.stat().st_size for t in targets if t.path.exists())))
     emit(ProgressEvent("scanned", index=0, total=total))
 
     result = MigrationResult()
     started = time.time()
 
-    for i, f in enumerate(targets, 1):
-        rel = f.relative_to(base).as_posix()
+    # この実行で置いた（ドライランなら置く予定の）移行先。同名ファイルが複数あるとき、
+    # ドライランでも実際の実行と同じ判定になるようにする。
+    placed: set[str] = set()
+    exists = lambda p: p.exists() or _root_id(p) in placed  # noqa: E731
+
+    for i, t in enumerate(targets, 1):
+        f, rel, shown = t.path, t.rel, t.shown
+        ledger.bind(t.root, dst)  # 台帳は「指定された移行元 → 移行先」ごとに区別する
 
         if should_cancel is not None and should_cancel():
             result.cancelled = True
@@ -373,21 +427,22 @@ def run_migration(src, dst, *,
         if ledger.is_done(rel):
             result.skipped += 1
             result.already_done += 1
-            log.debug("[%d/%d] 済: %s", i, total, rel)
+            log.debug("[%d/%d] 済: %s", i, total, shown)
             emit(ProgressEvent("skipped", i, total, rel))
             continue
 
-        dest = resolve_destination(dst / rel, on_exists)
+        dest = resolve_destination(dst / rel, on_exists, exists)
         if dest is None:
             result.skipped += 1
-            log.info("[%d/%d] 既存のためスキップ: %s", i, total, rel)
+            log.info("[%d/%d] 既存のためスキップ: %s", i, total, shown)
             ledger.record(rel, "skipped", reason="exists")
             emit(ProgressEvent("skipped", i, total, rel))
             continue
 
+        placed.add(_root_id(dest))
         if dry_run:
             result.copied += 1
-            log.info("[%d/%d] DRY-RUN %s -> %s", i, total, rel, dest)
+            log.info("[%d/%d] DRY-RUN %s -> %s", i, total, shown, dest)
             emit(ProgressEvent("dryrun", i, total, rel))
             continue
 
@@ -397,13 +452,13 @@ def run_migration(src, dst, *,
             result.copied += 1
             result.bytes_transferred += size
             ledger.record(rel, "done", dest=str(dest), size=size, sha256=digest)
-            log.info("[%d/%d] OK %s (%s)", i, total, rel, human(size))
+            log.info("[%d/%d] OK %s (%s)", i, total, shown, human(size))
             emit(ProgressEvent("done", i, total, rel, size=size))
         except Exception as e:  # 1 件の失敗で全体を止めない
             result.failed += 1
-            result.failures.append((rel, str(e)))
+            result.failures.append((shown, str(e)))
             ledger.record(rel, "failed", error=str(e))
-            log.error("[%d/%d] 失敗 %s: %s", i, total, rel, e)
+            log.error("[%d/%d] 失敗 %s: %s", i, total, shown, e)
             emit(ProgressEvent("failed", i, total, rel, error=str(e)))
 
     result.elapsed = time.time() - started
@@ -411,6 +466,31 @@ def run_migration(src, dst, *,
 
 
 # ================================================================ CLI
+
+def expand_sources(args: Sequence[str]) -> list[Path]:
+    """移行元の指定をパスのリストにする。
+
+    Windows のシェルは * や ? を展開しないため、ここで展開する。
+    見つからないものが 1 つでもあれば、何も始める前に ValueError にする。
+    """
+    sources: list[Path] = []
+    missing: list[str] = []
+    for a in args:
+        p = Path(a)
+        if p.exists():
+            sources.append(p)
+        elif any(c in a for c in "*?["):
+            hits = sorted(glob.glob(a, recursive=True))
+            if hits:
+                sources.extend(Path(h) for h in hits)
+            else:
+                missing.append(f"{a}（一致するものがありません）")
+        else:
+            missing.append(a)
+    if missing:
+        raise ValueError("移行元が見つかりません: " + ", ".join(missing))
+    return sources
+
 
 def setup_logging(log_path: Path | None, verbose: bool) -> None:
     LOGGER.setLevel(logging.DEBUG if verbose else logging.INFO)
@@ -428,10 +508,12 @@ def setup_logging(log_path: Path | None, verbose: bool) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="ファイル移行バッチ（検証・再開・ドライラン対応）")
-    p.add_argument("src", type=Path,
-                   help="移行元ディレクトリ、またはファイル（ファイルなら移行先直下に送る）")
-    p.add_argument("dst", type=Path, help="移行先ディレクトリ")
+    p = argparse.ArgumentParser(
+        description="ファイル移行バッチ（検証・再開・ドライラン対応）",
+        usage="%(prog)s [options] SRC [SRC ...] DST")
+    p.add_argument("paths", nargs="+", metavar="SRC... DST",
+                   help="移行元（ディレクトリ／ファイル／ワイルドカード、複数可）と、最後に移行先ディレクトリ。"
+                        "ディレクトリは中身を構成ごと、ファイルは移行先直下に送る")
     p.add_argument("--move", action="store_true", help="検証成功後に移行元を削除する")
     p.add_argument("--dry-run", action="store_true", help="書き込まずに対象だけ表示する")
     p.add_argument("--on-exists", choices=["skip", "overwrite", "rename"], default="skip",
@@ -452,20 +534,27 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     """終了コード: 0=全件成功 / 1=失敗あり / 2=引数エラー・中断"""
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if len(args.paths) < 2:
+        parser.error("移行元と移行先の両方を指定してください")
     setup_logging(args.log, args.verbose)
 
-    if not (args.src.is_dir() or args.src.is_file()):
-        LOGGER.error("移行元が見つかりません: %s", args.src)
+    dst = Path(args.paths[-1])
+    try:
+        sources = expand_sources(args.paths[:-1])
+    except ValueError as e:
+        LOGGER.error("%s", e)
         return 2
-    if args.dst.exists() and not args.dst.is_dir():
-        LOGGER.error("移行先がディレクトリではありません: %s", args.dst)
+    if dst.exists() and not dst.is_dir():
+        LOGGER.error("移行先がディレクトリではありません: %s", dst)
         return 2
-    # 単一ファイルの場合は、そのファイルがあるディレクトリを移行先にすると自分自身に転送してしまう
-    src_dir = args.src if args.src.is_dir() else args.src.parent
-    if src_dir.resolve() == args.dst.resolve():
-        LOGGER.error("移行元と移行先が同じです")
-        return 2
+    for src in sources:
+        # ファイルの場合は、そのファイルがあるディレクトリを移行先にすると自分自身に転送してしまう
+        src_dir = src if src.is_dir() else src.parent
+        if src_dir.resolve() == dst.resolve():
+            LOGGER.error("移行元と移行先が同じです: %s", src)
+            return 2
 
     try:
         filt = FileFilter(
@@ -482,12 +571,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ledger = Ledger(None if (args.dry_run or args.restart) else args.ledger)
 
     LOGGER.info("=" * 60)
-    LOGGER.info("移行開始: %s -> %s（%s%s）", args.src, args.dst,
+    shown_src = str(sources[0]) + (f" ほか {len(sources) - 1} 件" if len(sources) > 1 else "")
+    LOGGER.info("移行開始: %s -> %s（%s%s）", shown_src, dst,
                 "移動" if args.move else "コピー", "／ドライラン" if args.dry_run else "")
 
     try:
         result = run_migration(
-            args.src, args.dst, filt=filt, move=args.move,
+            sources, dst, filt=filt, move=args.move,
             verify=not args.no_verify, on_exists=args.on_exists,
             dry_run=args.dry_run, ledger=ledger, log=LOGGER)
     except KeyboardInterrupt:
