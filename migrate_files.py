@@ -400,6 +400,8 @@ def run_migration(src, dst, *,
     sources = [Path(src)] if isinstance(src, (str, os.PathLike)) else [Path(s) for s in src]
     dst = Path(dst)
     emit = progress or (lambda ev: None)
+    ledger.bind(src, dst)
+    base = src.parent if src.is_file() else src  # 単一ファイルなら dst/<ファイル名> に送る
 
     targets = collect_targets(sources, dst, filt, log)
     total = len(targets)

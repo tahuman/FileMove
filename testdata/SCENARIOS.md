@@ -98,6 +98,7 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | S15 | 存在しないファイルを指定 | 「移行元が見つかりません」/ exit 2 |
 | S16 | `docs/` に移動して相対パス `"meeting notes.txt"` を指定 | 成功 1 |
 
+<<<<<<< HEAD
 ## 複数指定
 
 `SRC [SRC ...] DST` の形で、最後の引数が移行先。ディレクトリ・ファイル・ワイルドカードを混ぜて指定できる。
@@ -121,6 +122,8 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | M13 | 引数が 1 つだけ | 使い方エラー / exit 2 |
 | M14 | 移行先を `src/docs` にして `docs/report_2026.PDF` を含める | 「移行元と移行先が同じです」/ exit 2 |
 
+=======
+>>>>>>> a67ccabaa807a776249a43fd0f2d9e4769695bdd
 ## このデータでは確認できないもの
 
 - ハッシュ不一致・コピー途中の失敗（`.part` が残らないこと）、Ctrl+C 中断 → `copy_fn` を差し替えるユニットテスト向き
