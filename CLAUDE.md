@@ -23,6 +23,16 @@ python -m pytest -m "not scenario"  # 単体テストだけ
 - 失敗・中断は本物の障害を起こさず、差し替えで再現する（`transfer_file` の `copy_fn`、`run_migration` の `should_cancel` / `progress`、`monkeypatch`）
 - 時刻に依存する処理は `now` を渡して固定する
 
+## CLI と GUI を分ける
+
+- 処理の本体は `migrate_files.py`（CLI もここ）。GUI は `gui/` に置き、本体の `run_migration()` を呼ぶだけにする
+- GUI に処理を書かない。新しい機能はまず本体に足し、CLI と GUI の両方から使えるようにする
+
+## デモ
+
+- CLI の振る舞いを変えたら `demo/demo.py` のステップを更新し、`python demo/make_gif.py` で GIF（`docs/images/`）を作り直す
+- GUI のデモは CLI と分けて `docs/images/gui/` に置く
+
 ## その他
 
-- `plan.md` は今後の機能・課題の一覧。終わったものは「完了」の表に移す
+- `plan.md` は今後の機能・課題の一覧。終わったものは「完了」の表に移す。デモのように更新し続けるものは「継続」に置き、完了には移さない

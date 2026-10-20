@@ -42,6 +42,11 @@ migrate_files.py のテスト（pytest）
     - [E2] 既存ファイルのスキップ・台帳での済・失敗・ドライランがそれぞれの status で届き、
            failed には error が入る
     - [E3] 中止したら、それ以降の通知は届かない
+  デモ（demo/demo.py と、その GIF を作る demo/make_gif.py）
+    - [G1] デモの全ステップが指定した作業フォルダで最後まで動き、⑧ の片付けと ⑨ の重複削除が効く
+    - [G2] --only N は N 番目のステップだけを表示する（前のステップは黙って実行される）
+    - [G3] make_gif: 全角を 2 桁として折り返し、コマンド・見出し・出力の種類で色を分ける
+    - [G4] make_gif: 行の並びから、複数フレームのループする GIF を作る（フォントが無い環境では skip）
   シナリオ（CLI 経由。testdata/SCENARIOS.md の表を testdata/run_scenarios.py で実行）
     - [S] 全シナリオ。前のシナリオの結果を使うもの（reset=False）は、前提から続けて実行する
 """
@@ -51,6 +56,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -503,6 +509,86 @@ def test_E3_no_events_after_cancel(tree):
     got, _ = _collect(src, dst, should_cancel=_cancel_after(1))
 
     assert got == [("scanned", 0, 3, ""), ("done", 1, 3, "a.txt")]
+
+
+# ================================================================ デモ
+
+DEMO = ROOT / "demo"
+
+
+def _run_demo(*args: str) -> str:
+    p = subprocess.run([sys.executable, str(DEMO / "demo.py"), *args],
+                       capture_output=True, text=True, encoding="utf-8",
+                       env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    return p.stdout
+
+
+@pytest.mark.scenario
+def test_G1_demo_runs_all_steps(tmp_path):
+    work = tmp_path / "work"
+
+    out = _run_demo("--auto", "--work", str(work))
+
+    assert "Traceback" not in out
+    assert "移行先に同じ内容があるため移行元を削除 7 件" in out      # ⑧
+    assert "重複を削除: 写真/2026/旅行_01 (1).jpg" in out            # ⑨
+    assert not (work / "新PC/写真/2026/旅行_01 (1).jpg").exists()
+    assert {p.name for p in (work / "旧PC").rglob("*") if p.is_file()} == {"Thumbs.db", "~$議事録 10月.docx"}
+
+
+@pytest.mark.scenario
+def test_G2_demo_only_one_step(tmp_path):
+    out = _run_demo("--only", "3", "--work", str(tmp_path / "work"))
+
+    assert [line for line in out.splitlines() if line.startswith("■")] == ["■ ③ 同じコマンドをもう一度"]
+    assert "台帳で処理済みとしてスキップ" in out   # ② が黙って実行されている
+
+
+@pytest.fixture
+def make_gif():
+    pytest.importorskip("PIL")
+    spec = importlib.util.spec_from_file_location("make_gif", DEMO / "make_gif.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_G3_make_gif_wrap_and_classify(make_gif):
+    assert make_gif.width("ab") == 2
+    assert make_gif.width("日本") == 4
+    assert make_gif.wrap("あ" * 5, cols=4) == ["ああ", "    あ", "    あ", "    あ"]
+
+    lines = make_gif.parse("\n■ ① 見出し\n  警告が出ます（説明文）\n\n\n"
+                           "  > python migrate_files.py a b\n"
+                           "    [1/2] 失敗 x: エラー\n"
+                           "    完了: 成功 1 / スキップ 0 / 失敗 1\n"
+                           "    重複を削除: a (1).txt\n"
+                           "  📁 out/\n     └─ a.txt\n"
+                           "    （終了コード 1）\n\n")
+    assert [(l.text.strip(), l.color) for l in lines] == [
+        ("", "text"), ("■ ① 見出し", "title"), ("警告が出ます（説明文）", "text"), ("", "text"),
+        ("> python migrate_files.py a b", "cmd"), ("[1/2] 失敗 x: エラー", "error"),
+        ("完了: 成功 1 / スキップ 0 / 失敗 1", "text"), ("重複を削除: a (1).txt", "warn"),
+        ("out/", "tree"), ("└─ a.txt", "tree"), ("（終了コード 1）", "dim")]
+
+
+def test_G4_make_gif_render(make_gif, tmp_path):
+    try:
+        fonts = make_gif.load_fonts()
+    except SystemExit:
+        pytest.skip("日本語フォントが無い環境")
+    lines = make_gif.parse("■ テスト\n  > python migrate_files.py a b\n    完了: 成功 1 / スキップ 0 / 失敗 0\n")
+    out = tmp_path / "t.gif"
+
+    n = make_gif.render(lines, out, fonts)
+
+    from PIL import Image
+    with Image.open(out) as im:
+        assert im.format == "GIF"
+        assert im.n_frames == n > 2
+        assert im.info.get("loop") == 0
 
 
 # ================================================================ シナリオ（CLI 経由）

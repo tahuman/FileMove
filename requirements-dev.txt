@@ -1,1 +1,2 @@
 pytest>=8
+Pillow>=10   # demo/make_gif.py（デモの GIF 作成）
