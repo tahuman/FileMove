@@ -1,0 +1,626 @@
+# -*- coding: utf-8 -*-
+"""
+migrate_files.py のテスト（pytest）
+
+実行:
+    python -m pytest                    # 全件（単体テスト＋シナリオ）
+    python -m pytest -m "not scenario"  # 単体テストだけ（1 秒かからない）
+    python -m pytest -k M1              # 名前で絞り込み
+
+テスト網羅:
+  値のパース
+    - [P1] parse_size: 単位なし・K/M/G・小数・"B" 付き・大文字小文字・単位前の空白、空なら None
+    - [P2] parse_size: 数値でないもの・単位なしの小数・未対応の単位（T）は ValueError（CLI では exit 2）
+    - [P3] parse_since: 30d / 12h / 0d は now からの相対、YYYY-MM-DD は日付、空なら None
+    - [P4] parse_since: 書式が不正（存在しない日付・単位違い・負数）なら ValueError
+  transfer_file（1 ファイルの転送）
+    - [T1] 正常にコピーでき、返り値の SHA-256 が移行元と一致し、.part が残らない
+    - [T2] verify=False のときはハッシュを計算せず空文字を返す
+    - [T3] move=True のときは転送後に移行元が消える
+    - [T4] ハッシュ不一致なら IOError。移行先・.part は残らず、move でも移行元は消えない
+    - [T5] コピー途中の失敗でも .part が残らず、移行元も消えず、例外はそのまま伝わる
+    - [T6] Ctrl+C 相当（KeyboardInterrupt）でも .part が残らない
+    - [T7] 失敗しても、移行先にあった既存ファイルは壊さない
+  run_migration（全体の流れ）
+    - [R1] should_cancel が True を返した時点で中断し、cancelled が立ち、残りは転送されない
+    - [R2] 最初から中止なら 1 件も転送しない
+    - [R3] 1 件の転送失敗で全体は止まらず、failures に記録され、台帳は failed になる
+    - [R4] failed は次回の実行で再試行され、done は台帳で処理済みとしてスキップされる
+  --move の移行元の片付け
+    - [V1] same_content: 中身が同じなら True。中身・サイズが違う、どちらかが無いなら False
+    - [V2] 移行先に同じ内容があれば転送せず移行元を削除し、台帳は done。中身が違えば移行元は残る
+    - [V3] コピー済み（台帳で done）を後から --move すると移行元が消える。rename 先（台帳の dest）も照合する
+    - [V4] ドライランでは移行元を消さずに件数だけ数える
+    - [V5] 移行元の削除に失敗したら failed になり、残りは続けて処理される
+  重複ファイルの削除（--dedupe）
+    - [D1] find_duplicates: `name (n).ext` で同じフォルダの `name.ext` と同じ内容のものだけを返す
+           （中身が違う・元が無い・番号なしのものは対象外。全角括弧・多重拡張子・サブフォルダも扱う）
+    - [D2] remove_duplicates: 重複だけを消し、ドライランでは消さない。`(1) (1)` の連鎖でも元は残る
+    - [D3] 削除に失敗したものは failures に入り、残りは続けて処理される
+  進捗通知（ProgressEvent。GUI の進捗バーが依存する）
+    - [E1] 最初に scanned（total 付き）、続いて 1 件ごとに done が index 1..total の順で届く
+    - [E2] 既存ファイルのスキップ・台帳での済・失敗・ドライランがそれぞれの status で届き、
+           failed には error が入る
+    - [E3] 中止したら、それ以降の通知は届かない
+  デモ（demo/demo.py と、その GIF を作る demo/make_gif.py）
+    - [G1] デモの全ステップが指定した作業フォルダで最後まで動き、⑧ の片付けと ⑨ の重複削除が効く
+    - [G2] --only N は N 番目のステップだけを表示する（前のステップは黙って実行される）
+    - [G3] make_gif: 全角を 2 桁として折り返し、コマンド・見出し・出力の種類で色を分ける
+    - [G4] make_gif: 行の並びから、複数フレームのループする GIF を作る（フォントが無い環境では skip）
+  シナリオ（CLI 経由。testdata/SCENARIOS.md の表を testdata/run_scenarios.py で実行）
+    - [S] 全シナリオ。前のシナリオの結果を使うもの（reset=False）は、前提から続けて実行する
+"""
+
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import os
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import pytest
+
+import migrate_files as mf
+
+ROOT = Path(__file__).resolve().parent
+
+
+# ================================================================ 共通
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _part(dest: Path) -> Path:
+    return dest.with_name(dest.name + ".part")
+
+
+def _names(d: Path) -> list[str]:
+    return sorted(p.name for p in d.iterdir())
+
+
+@pytest.fixture
+def src_file(tmp_path: Path) -> Path:
+    p = tmp_path / "src" / "a.txt"
+    p.parent.mkdir()
+    p.write_bytes(b"hello world")
+    return p
+
+
+@pytest.fixture
+def dest(tmp_path: Path) -> Path:
+    return tmp_path / "dst" / "a.txt"
+
+
+@pytest.fixture
+def tree(tmp_path: Path) -> tuple[Path, Path]:
+    """移行元に 3 ファイル（a, b, c）、移行先は空。"""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    for name in ("a.txt", "b.txt", "c.txt"):
+        (src / name).write_text(name, encoding="utf-8")
+    return src, dst
+
+
+@pytest.fixture
+def fail_on(monkeypatch):
+    """fail_on("b.txt") で、そのファイルだけ転送に失敗させる。"""
+    real = mf.transfer_file
+
+    def install(name: str) -> None:
+        def fake(src_file, dest, **kw):
+            if src_file.name == name:
+                raise OSError("読み取りエラー")
+            return real(src_file, dest, **kw)
+        monkeypatch.setattr(mf, "transfer_file", fake)
+
+    install.undo = monkeypatch.undo
+    return install
+
+
+def _cancel_after(n: int):
+    """n 回目の問い合わせから True を返す should_cancel。"""
+    calls = 0
+
+    def should_cancel() -> bool:
+        nonlocal calls
+        calls += 1
+        return calls > n
+    return should_cancel
+
+
+# ================================================================ 値のパース
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None),
+    ("", None),
+    ("1234", 1234),
+    ("0", 0),
+    ("500K", 500 * 1024),
+    ("1KB", 1024),
+    ("1kb", 1024),
+    ("10MB", 10 * 1024 ** 2),
+    ("1.5GB", int(1.5 * 1024 ** 3)),
+    (" 2M ", 2 * 1024 ** 2),
+    ("10 MB", 10 * 1024 ** 2),       # 数字と単位の間の空白は許す
+])
+def test_P1_parse_size(value, expected):
+    assert mf.parse_size(value) == expected
+
+
+@pytest.mark.parametrize("value", ["abc", "1.5", "MB", "1TB"])
+def test_P2_parse_size_invalid(value):
+    with pytest.raises(ValueError):
+        mf.parse_size(value)
+
+
+NOW = 1_800_000_000.0
+
+
+@pytest.mark.parametrize("value, expected", [
+    (None, None),
+    ("", None),
+    ("30d", NOW - 30 * 86400),
+    ("12h", NOW - 12 * 3600),
+    ("0d", NOW),
+    (" 7D ", NOW - 7 * 86400),
+    ("2025-04-01", datetime(2025, 4, 1).timestamp()),
+])
+def test_P3_parse_since(value, expected):
+    assert mf.parse_since(value, now=NOW) == expected
+
+
+@pytest.mark.parametrize("value", ["2026-13-01", "2026/04/01", "30m", "-1d", "d", "yesterday"])
+def test_P4_parse_since_invalid(value):
+    with pytest.raises(ValueError, match="書式が不正"):
+        mf.parse_since(value, now=NOW)
+
+
+# ================================================================ transfer_file
+
+def _corrupt_copy(src: Path, tmp: Path) -> None:
+    """中身が化けるコピー（転送先の破損、コピー中の更新を想定）。"""
+    tmp.write_bytes(b"corrupted")
+
+
+def _failing_copy(exc: BaseException):
+    """途中まで書いたところで exc を投げるコピー。"""
+    def copy(src: Path, tmp: Path) -> None:
+        tmp.write_bytes(b"hel")
+        raise exc
+    return copy
+
+
+def test_T1_copy_ok(src_file, dest):
+    digest = mf.transfer_file(src_file, dest)
+
+    assert dest.read_bytes() == b"hello world"
+    assert digest == _sha(b"hello world")
+    assert src_file.exists()
+    assert not _part(dest).exists()
+
+
+def test_T2_verify_off_returns_empty(src_file, dest):
+    assert mf.transfer_file(src_file, dest, verify=False) == ""
+    assert dest.read_bytes() == b"hello world"
+
+
+def test_T3_move_removes_source(src_file, dest):
+    mf.transfer_file(src_file, dest, move=True)
+
+    assert dest.read_bytes() == b"hello world"
+    assert not src_file.exists()
+
+
+@pytest.mark.parametrize("move", [False, True])
+def test_T4_hash_mismatch(src_file, dest, move):
+    with pytest.raises(IOError, match="ハッシュが一致しません"):
+        mf.transfer_file(src_file, dest, move=move, copy_fn=_corrupt_copy)
+
+    assert not dest.exists()
+    assert not _part(dest).exists()
+    assert src_file.read_bytes() == b"hello world"  # move でも移行元は消さない
+
+
+@pytest.mark.parametrize("exc", [OSError("ディスクがいっぱい"), KeyboardInterrupt()],
+                         ids=["T5_oserror", "T6_interrupt"])
+def test_T5_T6_failure_mid_copy(src_file, dest, exc):
+    with pytest.raises(type(exc)):
+        mf.transfer_file(src_file, dest, move=True, copy_fn=_failing_copy(exc))
+
+    assert not dest.exists()
+    assert not _part(dest).exists()
+    assert src_file.exists()
+
+
+def test_T7_failure_keeps_existing_dest(src_file, dest):
+    dest.parent.mkdir(parents=True)
+    dest.write_bytes(b"existing")
+
+    with pytest.raises(IOError):
+        mf.transfer_file(src_file, dest, copy_fn=_corrupt_copy)
+
+    assert dest.read_bytes() == b"existing"
+
+
+# ================================================================ run_migration
+
+def test_R1_cancel_midway(tree):
+    src, dst = tree
+
+    result = mf.run_migration(src, dst, should_cancel=_cancel_after(1))
+
+    assert result.cancelled
+    assert not result.ok
+    assert result.copied == 1
+    assert _names(dst) == ["a.txt"]
+
+
+def test_R2_cancel_before_start(tree):
+    src, dst = tree
+
+    result = mf.run_migration(src, dst, should_cancel=lambda: True)
+
+    assert result.cancelled
+    assert result.copied == 0
+    assert _names(dst) == []
+
+
+def test_R3_one_failure_does_not_stop(tree, fail_on):
+    src, dst = tree
+    fail_on("b.txt")
+    ledger = mf.Ledger(None)
+
+    result = mf.run_migration(src, dst, ledger=ledger)
+
+    assert (result.copied, result.failed) == (2, 1)
+    assert result.failures == [("b.txt", "読み取りエラー")]
+    assert _names(dst) == ["a.txt", "c.txt"]
+    ledger.bind(src, dst)
+    assert ledger.records[ledger._key("b.txt")]["status"] == "failed"
+
+
+def test_R4_retry_failed_with_ledger(tree, tmp_path, fail_on):
+    src, dst = tree
+    ledger_path = tmp_path / "ledger.jsonl"
+
+    fail_on("b.txt")
+    first = mf.Ledger(ledger_path)
+    mf.run_migration(src, dst, ledger=first)
+    first.close()
+    fail_on.undo()
+
+    second = mf.Ledger(ledger_path)
+    result = mf.run_migration(src, dst, ledger=second)
+    second.close()
+
+    assert result.copied == 1          # b だけ再試行
+    assert result.already_done == 2    # a, c は台帳で済
+    assert result.ok
+    assert (dst / "b.txt").read_text(encoding="utf-8") == "b.txt"
+
+
+# ================================================================ --move の移行元の片付け
+
+@pytest.fixture
+def unlink_fails_on(monkeypatch):
+    """unlink_fails_on("b.txt") で、その名前のファイルだけ削除に失敗させる。"""
+    real = Path.unlink
+
+    def install(name: str) -> None:
+        def fake(self, *a, **kw):
+            if self.name == name:
+                raise PermissionError("使用中です")
+            return real(self, *a, **kw)
+        monkeypatch.setattr(Path, "unlink", fake)
+    return install
+
+
+def test_V1_same_content(tmp_path):
+    a, b, c, d = (tmp_path / n for n in ("a", "b", "c", "d"))
+    a.write_bytes(b"hello")
+    b.write_bytes(b"hello")
+    c.write_bytes(b"world")   # 同じサイズで中身が違う
+    d.write_bytes(b"hello!")  # サイズが違う
+
+    assert mf.same_content(a, b)
+    assert not mf.same_content(a, c)
+    assert not mf.same_content(a, d)
+    assert not mf.same_content(a, tmp_path / "missing")
+    assert not mf.same_content(tmp_path / "missing", a)
+
+
+def test_V2_move_drops_source_when_dest_has_same_content(tree):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")   # 同じ内容
+    (dst / "b.txt").write_text("違う", encoding="utf-8")    # 中身が違う
+    ledger = mf.Ledger(None)
+
+    result = mf.run_migration(src, dst, move=True, ledger=ledger)
+
+    assert (result.copied, result.skipped, result.sources_removed) == (1, 2, 1)
+    assert _names(src) == ["b.txt"]                          # 中身が違うものだけ残る
+    assert (dst / "b.txt").read_text(encoding="utf-8") == "違う"
+    assert _names(dst) == ["a.txt", "b.txt", "c.txt"]        # a_1.txt などは作らない
+    ledger.bind(src, dst)
+    assert ledger.get("a.txt")["status"] == "done"
+
+
+def test_V3_move_after_copy_uses_ledger(tree, tmp_path):
+    src, dst = tree
+    (dst / "a.txt").write_text("既存", encoding="utf-8")
+    ledger_path = tmp_path / "ledger.jsonl"
+
+    first = mf.Ledger(ledger_path)
+    mf.run_migration(src, dst, on_exists="rename", ledger=first)   # a は a_1.txt に入る
+    first.close()
+    assert _names(src) == ["a.txt", "b.txt", "c.txt"]
+
+    second = mf.Ledger(ledger_path)
+    result = mf.run_migration(src, dst, move=True, ledger=second)
+    second.close()
+
+    assert (result.copied, result.already_done, result.sources_removed) == (0, 3, 3)
+    assert _names(src) == []
+    assert (dst / "a.txt").read_text(encoding="utf-8") == "既存"
+
+
+def test_V4_dry_run_keeps_source(tree):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")
+
+    result = mf.run_migration(src, dst, move=True, dry_run=True)
+
+    assert (result.copied, result.skipped, result.sources_removed) == (2, 1, 1)
+    assert _names(src) == ["a.txt", "b.txt", "c.txt"]
+
+
+def test_V5_drop_source_failure(tree, unlink_fails_on):
+    src, dst = tree
+    for name in ("a.txt", "b.txt"):
+        (dst / name).write_text(name, encoding="utf-8")
+    unlink_fails_on("a.txt")
+    ledger = mf.Ledger(None)
+
+    result = mf.run_migration(src, dst, move=True, ledger=ledger)
+
+    assert (result.copied, result.skipped, result.failed) == (1, 1, 1)
+    assert result.failures == [("a.txt", "使用中です")]
+    assert _names(src) == ["a.txt"]
+    ledger.bind(src, dst)
+    assert ledger.get("a.txt") == {}   # done にしないので次回また片付けを試みる
+
+
+# ================================================================ 重複ファイルの削除
+
+@pytest.fixture
+def dups(tmp_path: Path) -> Path:
+    """重複・重複でないものを混ぜたフォルダ。"""
+    root = tmp_path / "dst"
+    files = {
+        "report.txt": "same",
+        "report (1).txt": "same",          # 重複
+        "report (2).txt": "different",     # 中身が違う
+        "report(3).txt": "same",           # 空白なしも重複
+        "memo (1).txt": "orphan",          # 元が無い
+        "archive.tar.gz": "gz",
+        "archive (1).tar.gz": "gz",        # 多重拡張子
+        "sub/写真.jpg": "jpg",
+        "sub/写真（1）.jpg": "jpg",          # 全角括弧・サブフォルダ
+        "a.txt": "chain",
+        "a (1).txt": "chain",
+        "a (1) (1).txt": "chain",          # a (1).txt の重複
+        "plain.txt": "same",               # 番号なしは対象外
+    }
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+    return root
+
+
+def _rels(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+
+
+DUPLICATES = {"report (1).txt", "report(3).txt", "archive (1).tar.gz", "sub/写真（1）.jpg",
+              "a (1).txt", "a (1) (1).txt"}
+
+
+def test_D1_find_duplicates(dups):
+    pairs = mf.find_duplicates(dups)
+
+    got = {d.relative_to(dups).as_posix(): o.name for d, o in pairs}
+    assert got == {"report (1).txt": "report.txt", "report(3).txt": "report.txt",
+                   "archive (1).tar.gz": "archive.tar.gz", "sub/写真（1）.jpg": "写真.jpg",
+                   "a (1).txt": "a.txt", "a (1) (1).txt": "a (1).txt"}
+
+
+def test_D2_remove_duplicates(dups):
+    before = _rels(dups)
+
+    preview = mf.remove_duplicates(dups, dry_run=True)
+    assert preview.removed == len(DUPLICATES)
+    assert _rels(dups) == before
+
+    result = mf.remove_duplicates(dups)
+    assert result.removed == len(DUPLICATES)
+    assert result.bytes_freed == sum(len(n) for n in ("same", "same", "gz", "jpg", "chain", "chain"))
+    assert _rels(dups) == before - DUPLICATES
+    assert (dups / "a.txt").exists()
+
+
+def test_D3_remove_duplicates_failure(dups, unlink_fails_on):
+    unlink_fails_on("report (1).txt")
+
+    result = mf.remove_duplicates(dups)
+
+    assert result.failures == [("report (1).txt", "使用中です")]
+    assert result.removed == len(DUPLICATES) - 1
+    assert (dups / "report (1).txt").exists()
+
+
+# ================================================================ 進捗通知
+
+def _collect(src, dst, **kw) -> list[tuple]:
+    """run_migration の進捗通知を (status, index, total, rel) の列にする。"""
+    events: list[mf.ProgressEvent] = []
+    mf.run_migration(src, dst, progress=events.append, **kw)
+    return [(e.status, e.index, e.total, e.rel) for e in events], events
+
+
+def test_E1_progress_order(tree):
+    src, dst = tree
+
+    got, events = _collect(src, dst)
+
+    assert got == [("scanned", 0, 3, ""),
+                   ("done", 1, 3, "a.txt"),
+                   ("done", 2, 3, "b.txt"),
+                   ("done", 3, 3, "c.txt")]
+    assert all(e.size == 5 for e in events[1:])  # "a.txt" などの中身は 5 バイト
+
+
+def test_E2_progress_statuses(tree, tmp_path, fail_on):
+    src, dst = tree
+    (dst / "a.txt").write_text("既存", encoding="utf-8")   # a: 既存のためスキップ
+    ledger = mf.Ledger(tmp_path / "ledger.jsonl")
+    ledger.bind(src, dst)
+    ledger.record("c.txt", "done")                          # c: 台帳で済
+    fail_on("b.txt")                                        # b: 失敗
+
+    got, events = _collect(src, dst, ledger=ledger)
+    ledger.close()
+
+    assert [g[0] for g in got] == ["scanned", "skipped", "failed", "skipped"]
+    assert events[2].error == "読み取りエラー"
+
+    got, _ = _collect(src, dst, dry_run=True, ledger=mf.Ledger(None))
+    assert [g[0] for g in got] == ["scanned", "skipped", "dryrun", "dryrun"]
+
+
+def test_E3_no_events_after_cancel(tree):
+    src, dst = tree
+
+    got, _ = _collect(src, dst, should_cancel=_cancel_after(1))
+
+    assert got == [("scanned", 0, 3, ""), ("done", 1, 3, "a.txt")]
+
+
+# ================================================================ デモ
+
+DEMO = ROOT / "demo"
+
+
+def _run_demo(*args: str) -> str:
+    p = subprocess.run([sys.executable, str(DEMO / "demo.py"), *args],
+                       capture_output=True, text=True, encoding="utf-8",
+                       env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    assert p.returncode == 0, p.stdout + p.stderr
+    return p.stdout
+
+
+@pytest.mark.scenario
+def test_G1_demo_runs_all_steps(tmp_path):
+    work = tmp_path / "work"
+
+    out = _run_demo("--auto", "--work", str(work))
+
+    assert "Traceback" not in out
+    assert "移行先に同じ内容があるため移行元を削除 7 件" in out      # ⑧
+    assert "重複を削除: 写真/2026/旅行_01 (1).jpg" in out            # ⑨
+    assert not (work / "新PC/写真/2026/旅行_01 (1).jpg").exists()
+    assert {p.name for p in (work / "旧PC").rglob("*") if p.is_file()} == {"Thumbs.db", "~$議事録 10月.docx"}
+
+
+@pytest.mark.scenario
+def test_G2_demo_only_one_step(tmp_path):
+    out = _run_demo("--only", "3", "--work", str(tmp_path / "work"))
+
+    assert [line for line in out.splitlines() if line.startswith("■")] == ["■ ③ 同じコマンドをもう一度"]
+    assert "台帳で処理済みとしてスキップ" in out   # ② が黙って実行されている
+
+
+@pytest.fixture
+def make_gif():
+    pytest.importorskip("PIL")
+    spec = importlib.util.spec_from_file_location("make_gif", DEMO / "make_gif.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_G3_make_gif_wrap_and_classify(make_gif):
+    assert make_gif.width("ab") == 2
+    assert make_gif.width("日本") == 4
+    assert make_gif.wrap("あ" * 5, cols=4) == ["ああ", "    あ", "    あ", "    あ"]
+
+    lines = make_gif.parse("\n■ ① 見出し\n  警告が出ます（説明文）\n\n\n"
+                           "  > python migrate_files.py a b\n"
+                           "    [1/2] 失敗 x: エラー\n"
+                           "    完了: 成功 1 / スキップ 0 / 失敗 1\n"
+                           "    重複を削除: a (1).txt\n"
+                           "  📁 out/\n     └─ a.txt\n"
+                           "    （終了コード 1）\n\n")
+    assert [(l.text.strip(), l.color) for l in lines] == [
+        ("", "text"), ("■ ① 見出し", "title"), ("警告が出ます（説明文）", "text"), ("", "text"),
+        ("> python migrate_files.py a b", "cmd"), ("[1/2] 失敗 x: エラー", "error"),
+        ("完了: 成功 1 / スキップ 0 / 失敗 1", "text"), ("重複を削除: a (1).txt", "warn"),
+        ("out/", "tree"), ("└─ a.txt", "tree"), ("（終了コード 1）", "dim")]
+
+
+def test_G4_make_gif_render(make_gif, tmp_path):
+    try:
+        fonts = make_gif.load_fonts()
+    except SystemExit:
+        pytest.skip("日本語フォントが無い環境")
+    lines = make_gif.parse("■ テスト\n  > python migrate_files.py a b\n    完了: 成功 1 / スキップ 0 / 失敗 0\n")
+    out = tmp_path / "t.gif"
+
+    n = make_gif.render(lines, out, fonts)
+
+    from PIL import Image
+    with Image.open(out) as im:
+        assert im.format == "GIF"
+        assert im.n_frames == n > 2
+        assert im.info.get("loop") == 0
+
+
+# ================================================================ シナリオ（CLI 経由）
+
+def _load_scenarios():
+    spec = importlib.util.spec_from_file_location(
+        "run_scenarios", ROOT / "testdata" / "run_scenarios.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module  # dataclass が自分のモジュールを参照するため
+    spec.loader.exec_module(module)
+    return module
+
+
+rs = _load_scenarios()
+
+
+def _chain(i: int) -> list:
+    """i 番目のシナリオと、その前提になる直前のシナリオ（reset=False で繋がるもの）。"""
+    start = i
+    while start > 0 and not rs.SCENARIOS[start].reset:
+        start -= 1
+    return rs.SCENARIOS[start:i + 1]
+
+
+@pytest.mark.scenario
+@pytest.mark.parametrize("i", range(len(rs.SCENARIOS)),
+                         ids=[f"{sc.sid}-{sc.title}" for sc in rs.SCENARIOS])
+def test_S_scenario(i):
+    sc = rs.SCENARIOS[i]
+    if sc.windows_only and os.name != "nt":
+        pytest.skip("Windows のみ")
+
+    for step in _chain(i):
+        ok, why = rs.run(step)
+        assert ok, f"{step.sid} {step.title}: {why}"

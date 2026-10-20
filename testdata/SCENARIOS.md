@@ -53,7 +53,7 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 
 ## シナリオと期待結果
 
-（2026-10-13 時点の実装で全件確認済み。18・19 は一時ディレクトリで実施）
+（2026-10-20 時点の実装で全件確認済み。18・19 は一時ディレクトリで実施）
 
 | # | コマンド（追加引数） | 期待結果 |
 |---|---|---|
@@ -76,6 +76,8 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | 17 | src に存在しないパスを指定 | 「移行元が見つかりません」/ exit 2 |
 | 18 | 既定の台帳のまま `A→outA`、続けて `B→outB`（どちらにも `report.txt`） | 2 回とも成功 1。B のファイルが台帳のせいでスキップされない |
 | 19 | 18 の後に `a→OUTA`（大文字小文字だけ違うパス、Windows） | 同じ移行とみなし、台帳で処理済みとしてスキップ 1 |
+| 20 | 7 の直後に `--move` | 成功 0・スキップ 24、「うち移行先に同じ内容があるため移行元を削除 22 件」。src に残るのは conflict/same.txt と conflict/renamed.txt のみ（中身が違うため） |
+| 21 | 7 の直後に `--move --restart`（台帳を使わない） | 20 と同じ。移行先に同じ内容があるかで判定する |
 
 ## 単一ファイル指定
 
@@ -120,6 +122,16 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | M12 | M1 に `--ext pdf` | 成功 1 |
 | M13 | 引数が 1 つだけ | 使い方エラー / exit 2 |
 | M14 | 移行先を `src/docs` にして `docs/report_2026.PDF` を含める | 「移行元と移行先が同じです」/ exit 2 |
+
+## 重複ファイルの削除（--dedupe）
+
+転送の後、移行先で `name (1).ext` のような番号付きのファイルが、同じフォルダの `name.ext` と同じ内容なら削除する。
+データは `run_scenarios.py` が `$W/dup/` に作る（`in/new.txt`、`out/` に `report.txt`・`report (1).txt`（同じ内容）・`report (2).txt`（中身違い）・`memo (1).txt`（元なし））。
+
+| # | コマンド（`$W/dup/in $W/dup/out` に追加） | 期待結果 |
+|---|---|---|
+| D1 | `--dedupe` | 成功 1、「重複ファイルの削除: 1 件」。`report (1).txt` だけ消え、`report (2).txt`・`memo (1).txt` は残る |
+| D2 | `--dedupe --dry-run` | 「DRY-RUN 重複を削除: report (1).txt」と表示され、何も消えない |
 
 ## このデータでは確認できないもの
 
