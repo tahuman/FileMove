@@ -4,7 +4,8 @@
 ファイル移行バッチ
 
 ディレクトリ構成を保ったままファイルをコピー／移動する。
-振る舞いの一覧は TESTLIST.md、検証は test_migrate_files.py を参照。
+振る舞いの一覧は testdata/SCENARIOS.md（自動実行は testdata/run_scenarios.py）、
+単体テストは test_migrate_files.py を参照。
 
 設計上の方針（テストしやすさのため）:
   - 副作用のある処理は差し替え可能にする（copy_fn, now, log, ledger を注入できる）
