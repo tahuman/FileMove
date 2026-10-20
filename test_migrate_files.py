@@ -57,9 +57,7 @@ import hashlib
 import importlib.util
 import os
 import subprocess
-import sys
 from datetime import datetime
-from pathlib import Path
 
 import pytest
 
