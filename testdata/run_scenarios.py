@@ -106,6 +106,26 @@ SCENARIOS: list[Scenario] = [
              check=lambda o: expect(read(W / "ab/outB/report.txt") == "b\n", "B がコピーされない")),
     Scenario("19", "大文字小文字違いは同じ移行", ["a", "OUTA"], counts=(0, 1, 0),
              std_ledger=False, cwd=W / "ab", reset=False, windows_only=True),
+    Scenario("20", "コピー（後で --move する前提）", [S(), DST], counts=(22, 2, 0)),
+    Scenario("20b", "コピー済みを --move で片付け", [S(), DST, "--move"], counts=(0, 24, 0), reset=False,
+             check=lambda o: (expect("移行元を削除 22 件" in o, "削除件数の表示なし"),
+                              expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
+                                     f"src の残り: {files(SRC)}"))),
+    Scenario("21", "コピー（台帳なしで --move する前提）", [S(), DST], counts=(22, 2, 0)),
+    Scenario("21b", "台帳なしでも同じ内容なら --move で片付け", [S(), DST, "--move", "--restart"],
+             counts=(0, 24, 0), reset=False,
+             check=lambda o: expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
+                                    f"src の残り: {files(SRC)}")),
+
+    # ---------------------------------------------------------------- 重複ファイルの削除
+    Scenario("D1", "--dedupe", [W / "dup/in", W / "dup/out", "--dedupe"], counts=(1, 0, 0),
+             check=lambda o: (expect("重複ファイルの削除: 1 件" in o, "削除件数の表示なし"),
+                              expect(files(W / "dup/out") == {"new.txt", "report.txt", "report (2).txt",
+                                                              "memo (1).txt"}, f"out: {files(W / 'dup/out')}"))),
+    Scenario("D2", "--dedupe のドライラン", [W / "dup/in", W / "dup/out", "--dedupe", "--dry-run"],
+             counts=(1, 0, 0),
+             check=lambda o: (expect("DRY-RUN 重複を削除: report (1).txt" in o, "削除予定の表示なし"),
+                              expect((W / "dup/out/report (1).txt").exists(), "ドライランで消えた"))),
 
     # ---------------------------------------------------------------- 単一ファイル
     Scenario("S1", "単一ファイルのコピー", [S("docs/議事録_2026年10月.docx"), OUT], counts=(1, 0, 0),
@@ -188,6 +208,12 @@ def reset() -> None:
     for name, body in (("A", "a\n"), ("B", "b\n")):
         (ab / name).mkdir(parents=True, exist_ok=True)
         (ab / name / "report.txt").write_text(body, encoding="utf-8")
+    # --dedupe 用: report (1).txt だけが重複（(2) は中身違い、memo (1) は元が無い）
+    for rel, body in (("in/new.txt", "new\n"), ("out/report.txt", "same\n"),
+                      ("out/report (1).txt", "same\n"), ("out/report (2).txt", "different\n"),
+                      ("out/memo (1).txt", "orphan\n")):
+        (W / "dup" / rel).parent.mkdir(parents=True, exist_ok=True)
+        (W / "dup" / rel).write_text(body, encoding="utf-8")
 
 
 def run(sc: Scenario) -> tuple[bool, str]:

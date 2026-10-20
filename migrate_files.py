@@ -16,6 +16,7 @@
     python migrate_files.py /data/old /data/new --dry-run
     python migrate_files.py /data/old /data/new --ext pdf,xlsx --since 30d
     python migrate_files.py /data/old /data/new --move
+    python migrate_files.py /data/old /data/new --dedupe        # 移行先の "name (1).ext" の重複を削除
     python migrate_files.py /data/old/report.pdf /data/new   # 単一ファイル -> /data/new/report.pdf
     python migrate_files.py a/x.pdf b/y.xlsx "c/*.txt" /data/new  # 複数指定（最後が移行先）
 """
@@ -29,6 +30,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import time
@@ -91,6 +93,16 @@ def sha256_of(path: Path) -> str:
         for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def same_content(a: Path, b: Path) -> bool:
+    """2 つのファイルの中身が同じか。どちらかが無い・サイズが違うならハッシュは計算しない。"""
+    try:
+        if not (a.is_file() and b.is_file()) or a.stat().st_size != b.stat().st_size:
+            return False
+        return sha256_of(a) == sha256_of(b)
+    except OSError:
+        return False
 
 
 # ================================================================ 移行先の決定
@@ -204,7 +216,11 @@ class Ledger:
 
     def is_done(self, rel: str) -> bool:
         """成功したものだけ処理済みとみなす。failed は次回に再試行させる。"""
-        return self.records.get(self._key(rel), {}).get("status") == "done"
+        return self.get(rel).get("status") == "done"
+
+    def get(self, rel: str) -> dict:
+        """記録を返す。無ければ空の dict。"""
+        return self.records.get(self._key(rel), {})
 
     def record(self, rel: str, status: str, **extra) -> None:
         rec = {"path": rel, "status": status,
@@ -327,6 +343,7 @@ class MigrationResult:
     copied: int = 0
     skipped: int = 0
     already_done: int = 0   # skipped のうち、台帳で処理済みだったもの
+    sources_removed: int = 0  # skipped のうち、--move で移行先に同じ内容があり移行元だけ消したもの
     failed: int = 0
     bytes_transferred: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
@@ -392,6 +409,8 @@ def run_migration(src, dst, *,
     """移行を実行して結果を返す。表示や終了コードは呼び出し側に任せる。
 
     src: 移行元のパス、またはパスのリスト（ディレクトリ・ファイル混在可）
+    move: 移行元を削除する。移行先に同じ内容が既にあるもの（台帳で済・既存）は
+          転送せずに移行元だけ削除する（以前にコピーしたものを後から片付けられる）
     progress: 1 ファイルごとに ProgressEvent が渡される（GUI の進捗表示用）
     should_cancel: True を返すと、その時点で安全に中断する
     """
@@ -416,6 +435,22 @@ def run_migration(src, dst, *,
     placed: set[str] = set()
     exists = lambda p: p.exists() or _root_id(p) in placed  # noqa: E731
 
+    def drop_source(i: int, t: _Target) -> bool:
+        """移行先に同じ内容がある移行元を削除する。失敗したら failed として扱い False を返す。"""
+        if not dry_run:
+            try:
+                t.path.unlink()
+            except OSError as e:
+                result.failed += 1
+                result.failures.append((t.shown, str(e)))
+                log.error("[%d/%d] 移行元を削除できません %s: %s", i, total, t.shown, e)
+                emit(ProgressEvent("failed", i, total, t.rel, error=str(e)))
+                return False
+        result.sources_removed += 1
+        log.info("[%d/%d] %s移行先に同じ内容があるため移行元を削除: %s",
+                 i, total, "DRY-RUN " if dry_run else "", t.shown)
+        return True
+
     for i, t in enumerate(targets, 1):
         f, rel, shown = t.path, t.rel, t.shown
         ledger.bind(t.root, dst)  # 台帳は「指定された移行元 → 移行先」ごとに区別する
@@ -426,10 +461,24 @@ def run_migration(src, dst, *,
             break
 
         if ledger.is_done(rel):
+            # 以前にコピーしたものを --move で片付ける。rename された場合は台帳の dest を見る
+            copied_to = Path(ledger.get(rel).get("dest") or dst / rel)
+            if move and same_content(f, copied_to):
+                if not drop_source(i, t):
+                    continue
+            else:
+                log.debug("[%d/%d] 済: %s", i, total, shown)
             result.skipped += 1
             result.already_done += 1
-            log.debug("[%d/%d] 済: %s", i, total, shown)
             emit(ProgressEvent("skipped", i, total, rel))
+            continue
+
+        if move and same_content(f, dst / rel):
+            # 移行先に同じ内容が既にある = 移動済みとみなす（同名で残したり _1 を作ったりしない）
+            if drop_source(i, t):
+                result.skipped += 1
+                ledger.record(rel, "done", dest=str(dst / rel), reason="same_content")
+                emit(ProgressEvent("skipped", i, total, rel))
             continue
 
         dest = resolve_destination(dst / rel, on_exists, exists)
@@ -463,6 +512,66 @@ def run_migration(src, dst, *,
             emit(ProgressEvent("failed", i, total, rel, error=str(e)))
 
     result.elapsed = time.time() - started
+    return result
+
+
+# ================================================================ 重複ファイルの削除
+
+# "name (1).ext" / "name(2).tar.gz" / "name（3）.txt"。stem は最短一致にして、
+# "a (1) (2).txt" は "a (1).txt" の 2 番目として扱う
+_NUMBERED = re.compile(r"^(?P<stem>.+?) ?[(（]\d+[)）](?P<ext>(?:\.[^.]+)*)$")
+
+
+def find_duplicates(root: Path) -> list[tuple[Path, Path]]:
+    """root 配下で、番号付きのファイル（例: `file (1).txt`）のうち、同じフォルダに
+    番号なしのファイル（`file.txt`）があって中身も同じものを (重複, 元) の組で返す。
+
+    元のファイルが無い、または中身が違うものは対象にしない。
+    """
+    pairs: list[tuple[Path, Path]] = []
+    for dirpath, _, filenames in os.walk(root):
+        here = Path(dirpath)
+        for name in sorted(filenames):
+            m = _NUMBERED.match(name)
+            if not m:
+                continue
+            dup, original = here / name, here / (m["stem"] + m["ext"])
+            if same_content(dup, original):
+                pairs.append((dup, original))
+    return pairs
+
+
+@dataclass
+class DedupeResult:
+    removed: int = 0
+    bytes_freed: int = 0
+    failures: list[tuple[str, str]] = field(default_factory=list)
+
+
+def remove_duplicates(root, *, dry_run: bool = False,
+                      log: logging.Logger | None = None) -> DedupeResult:
+    """find_duplicates() で見つかった重複を削除する。dry_run なら表示だけ。
+
+    削除する組はすべて先に決めてから消すので、`a.txt` / `a (1).txt` / `a (1) (1).txt`
+    が同じ中身なら `a.txt` だけが残る。
+    """
+    log = log or LOGGER
+    root = Path(root)
+    result = DedupeResult()
+    for dup, original in find_duplicates(root):
+        shown = dup.relative_to(root).as_posix()
+        size = dup.stat().st_size
+        if not dry_run:
+            try:
+                dup.unlink()
+            except OSError as e:
+                result.failures.append((shown, str(e)))
+                log.error("重複ファイルを削除できません %s: %s", shown, e)
+                continue
+        result.removed += 1
+        result.bytes_freed += size
+        log.info("%s重複を削除: %s（%s と同じ内容）",
+                 "DRY-RUN " if dry_run else "", shown, original.name)
     return result
 
 
@@ -515,7 +624,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("paths", nargs="+", metavar="SRC... DST",
                    help="移行元（ディレクトリ／ファイル／ワイルドカード、複数可）と、最後に移行先ディレクトリ。"
                         "ディレクトリは中身を構成ごと、ファイルは移行先直下に送る")
-    p.add_argument("--move", action="store_true", help="検証成功後に移行元を削除する")
+    p.add_argument("--move", action="store_true",
+                   help="検証成功後に移行元を削除する。移行先に同じ内容が既にあるものも移行元を削除する")
+    p.add_argument("--dedupe", action="store_true",
+                   help="転送後、移行先で `name (1).ext` のような番号付きファイルが"
+                        "番号なしのものと同じ内容なら削除する")
     p.add_argument("--dry-run", action="store_true", help="書き込まずに対象だけ表示する")
     p.add_argument("--on-exists", choices=["skip", "overwrite", "rename"], default="skip",
                    help="移行先に同名ファイルがある場合の動作（既定: skip）")
@@ -593,15 +706,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     if result.already_done:
         LOGGER.info("  うち台帳で処理済みとしてスキップ %d 件（最初からやり直すには --restart）",
                     result.already_done)
+    if result.sources_removed:
+        LOGGER.info("  うち移行先に同じ内容があるため移行元を削除 %d 件", result.sources_removed)
     LOGGER.info("転送量 %s / 所要 %.1f秒", human(result.bytes_transferred), result.elapsed)
     for rel, err in result.failures:
         LOGGER.info("  - 失敗: %s: %s", rel, err)
+
+    dedupe = DedupeResult()
+    if args.dedupe and not result.cancelled and dst.is_dir():
+        dedupe = remove_duplicates(dst, dry_run=args.dry_run, log=LOGGER)
+        LOGGER.info("重複ファイルの削除: %d 件 / %s", dedupe.removed, human(dedupe.bytes_freed))
+        for rel, err in dedupe.failures:
+            LOGGER.info("  - 失敗: %s: %s", rel, err)
+
     if args.dry_run:
         LOGGER.info("※ ドライランのため何も書き込んでいません。")
 
     if result.cancelled:
         return 2
-    return 0 if result.failed == 0 else 1
+    return 0 if result.failed == 0 and not dedupe.failures else 1
 
 
 if __name__ == "__main__":
