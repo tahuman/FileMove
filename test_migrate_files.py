@@ -26,6 +26,17 @@ migrate_files.py のテスト（pytest）
     - [R2] 最初から中止なら 1 件も転送しない
     - [R3] 1 件の転送失敗で全体は止まらず、failures に記録され、台帳は failed になる
     - [R4] failed は次回の実行で再試行され、done は台帳で処理済みとしてスキップされる
+  --move の移行元の片付け
+    - [V1] same_content: 中身が同じなら True。中身・サイズが違う、どちらかが無いなら False
+    - [V2] 移行先に同じ内容があれば転送せず移行元を削除し、台帳は done。中身が違えば移行元は残る
+    - [V3] コピー済み（台帳で done）を後から --move すると移行元が消える。rename 先（台帳の dest）も照合する
+    - [V4] ドライランでは移行元を消さずに件数だけ数える
+    - [V5] 移行元の削除に失敗したら failed になり、残りは続けて処理される
+  重複ファイルの削除（--dedupe）
+    - [D1] find_duplicates: `name (n).ext` で同じフォルダの `name.ext` と同じ内容のものだけを返す
+           （中身が違う・元が無い・番号なしのものは対象外。全角括弧・多重拡張子・サブフォルダも扱う）
+    - [D2] remove_duplicates: 重複だけを消し、ドライランでは消さない。`(1) (1)` の連鎖でも元は残る
+    - [D3] 削除に失敗したものは failures に入り、残りは続けて処理される
   進捗通知（ProgressEvent。GUI の進捗バーが依存する）
     - [E1] 最初に scanned（total 付き）、続いて 1 件ごとに done が index 1..total の順で届く
     - [E2] 既存ファイルのスキップ・台帳での済・失敗・ドライランがそれぞれの status で届き、
@@ -285,6 +296,166 @@ def test_R4_retry_failed_with_ledger(tree, tmp_path, fail_on):
     assert result.already_done == 2    # a, c は台帳で済
     assert result.ok
     assert (dst / "b.txt").read_text(encoding="utf-8") == "b.txt"
+
+
+# ================================================================ --move の移行元の片付け
+
+@pytest.fixture
+def unlink_fails_on(monkeypatch):
+    """unlink_fails_on("b.txt") で、その名前のファイルだけ削除に失敗させる。"""
+    real = Path.unlink
+
+    def install(name: str) -> None:
+        def fake(self, *a, **kw):
+            if self.name == name:
+                raise PermissionError("使用中です")
+            return real(self, *a, **kw)
+        monkeypatch.setattr(Path, "unlink", fake)
+    return install
+
+
+def test_V1_same_content(tmp_path):
+    a, b, c, d = (tmp_path / n for n in ("a", "b", "c", "d"))
+    a.write_bytes(b"hello")
+    b.write_bytes(b"hello")
+    c.write_bytes(b"world")   # 同じサイズで中身が違う
+    d.write_bytes(b"hello!")  # サイズが違う
+
+    assert mf.same_content(a, b)
+    assert not mf.same_content(a, c)
+    assert not mf.same_content(a, d)
+    assert not mf.same_content(a, tmp_path / "missing")
+    assert not mf.same_content(tmp_path / "missing", a)
+
+
+def test_V2_move_drops_source_when_dest_has_same_content(tree):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")   # 同じ内容
+    (dst / "b.txt").write_text("違う", encoding="utf-8")    # 中身が違う
+    ledger = mf.Ledger(None)
+
+    result = mf.run_migration(src, dst, move=True, ledger=ledger)
+
+    assert (result.copied, result.skipped, result.sources_removed) == (1, 2, 1)
+    assert _names(src) == ["b.txt"]                          # 中身が違うものだけ残る
+    assert (dst / "b.txt").read_text(encoding="utf-8") == "違う"
+    assert _names(dst) == ["a.txt", "b.txt", "c.txt"]        # a_1.txt などは作らない
+    ledger.bind(src, dst)
+    assert ledger.get("a.txt")["status"] == "done"
+
+
+def test_V3_move_after_copy_uses_ledger(tree, tmp_path):
+    src, dst = tree
+    (dst / "a.txt").write_text("既存", encoding="utf-8")
+    ledger_path = tmp_path / "ledger.jsonl"
+
+    first = mf.Ledger(ledger_path)
+    mf.run_migration(src, dst, on_exists="rename", ledger=first)   # a は a_1.txt に入る
+    first.close()
+    assert _names(src) == ["a.txt", "b.txt", "c.txt"]
+
+    second = mf.Ledger(ledger_path)
+    result = mf.run_migration(src, dst, move=True, ledger=second)
+    second.close()
+
+    assert (result.copied, result.already_done, result.sources_removed) == (0, 3, 3)
+    assert _names(src) == []
+    assert (dst / "a.txt").read_text(encoding="utf-8") == "既存"
+
+
+def test_V4_dry_run_keeps_source(tree):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")
+
+    result = mf.run_migration(src, dst, move=True, dry_run=True)
+
+    assert (result.copied, result.skipped, result.sources_removed) == (2, 1, 1)
+    assert _names(src) == ["a.txt", "b.txt", "c.txt"]
+
+
+def test_V5_drop_source_failure(tree, unlink_fails_on):
+    src, dst = tree
+    for name in ("a.txt", "b.txt"):
+        (dst / name).write_text(name, encoding="utf-8")
+    unlink_fails_on("a.txt")
+    ledger = mf.Ledger(None)
+
+    result = mf.run_migration(src, dst, move=True, ledger=ledger)
+
+    assert (result.copied, result.skipped, result.failed) == (1, 1, 1)
+    assert result.failures == [("a.txt", "使用中です")]
+    assert _names(src) == ["a.txt"]
+    ledger.bind(src, dst)
+    assert ledger.get("a.txt") == {}   # done にしないので次回また片付けを試みる
+
+
+# ================================================================ 重複ファイルの削除
+
+@pytest.fixture
+def dups(tmp_path: Path) -> Path:
+    """重複・重複でないものを混ぜたフォルダ。"""
+    root = tmp_path / "dst"
+    files = {
+        "report.txt": "same",
+        "report (1).txt": "same",          # 重複
+        "report (2).txt": "different",     # 中身が違う
+        "report(3).txt": "same",           # 空白なしも重複
+        "memo (1).txt": "orphan",          # 元が無い
+        "archive.tar.gz": "gz",
+        "archive (1).tar.gz": "gz",        # 多重拡張子
+        "sub/写真.jpg": "jpg",
+        "sub/写真（1）.jpg": "jpg",          # 全角括弧・サブフォルダ
+        "a.txt": "chain",
+        "a (1).txt": "chain",
+        "a (1) (1).txt": "chain",          # a (1).txt の重複
+        "plain.txt": "same",               # 番号なしは対象外
+    }
+    for rel, body in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body, encoding="utf-8")
+    return root
+
+
+def _rels(root: Path) -> set[str]:
+    return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
+
+
+DUPLICATES = {"report (1).txt", "report(3).txt", "archive (1).tar.gz", "sub/写真（1）.jpg",
+              "a (1).txt", "a (1) (1).txt"}
+
+
+def test_D1_find_duplicates(dups):
+    pairs = mf.find_duplicates(dups)
+
+    got = {d.relative_to(dups).as_posix(): o.name for d, o in pairs}
+    assert got == {"report (1).txt": "report.txt", "report(3).txt": "report.txt",
+                   "archive (1).tar.gz": "archive.tar.gz", "sub/写真（1）.jpg": "写真.jpg",
+                   "a (1).txt": "a.txt", "a (1) (1).txt": "a (1).txt"}
+
+
+def test_D2_remove_duplicates(dups):
+    before = _rels(dups)
+
+    preview = mf.remove_duplicates(dups, dry_run=True)
+    assert preview.removed == len(DUPLICATES)
+    assert _rels(dups) == before
+
+    result = mf.remove_duplicates(dups)
+    assert result.removed == len(DUPLICATES)
+    assert result.bytes_freed == sum(len(n) for n in ("same", "same", "gz", "jpg", "chain", "chain"))
+    assert _rels(dups) == before - DUPLICATES
+    assert (dups / "a.txt").exists()
+
+
+def test_D3_remove_duplicates_failure(dups, unlink_fails_on):
+    unlink_fails_on("report (1).txt")
+
+    result = mf.remove_duplicates(dups)
+
+    assert result.failures == [("report (1).txt", "使用中です")]
+    assert result.removed == len(DUPLICATES) - 1
+    assert (dups / "report (1).txt").exists()
 
 
 # ================================================================ 進捗通知
