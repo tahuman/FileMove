@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-demo.py の各ステップを、ターミナル風のアニメーション GIF にする。
+demo.py の各パターンを、Windows Terminal 風のアニメーション GIF にする。
 
     python -m pip install -r requirements-dev.txt   # Pillow が必要
-    python demo/make_gif.py              # 全ステップ -> docs/images/demo_*.gif
-    python demo/make_gif.py 1 8          # 指定したステップだけ
+    python demo/make_gif.py              # 全パターン -> docs/images/demo_p*.gif
+    python demo/make_gif.py 1 3          # 指定したパターンだけ（P1 と P3）
 
-demo.py をステップごとに --only で実行し、その出力を描画する。
-コマンド行（"> python …"）は 1 文字ずつ打ち込むように、それ以外は 1 行ずつ表示する。
+demo.py をパターンごとに --only で実行し、その出力を描画する。
+コマンド行（"PS C:\\…> python …"）は 1 文字ずつ打ち込むように、それ以外は 1 行ずつ表示する。
 作業フォルダは一時ディレクトリを使い、docs/images/ 以外には何も書き込まない。
 """
 
@@ -46,15 +46,18 @@ COLS, ROWS = 96, 34            # 画面の桁数・行数（半角換算）
 FONT_SIZE, CELL_W, LINE_H = 16, 9, 22   # CELL_W は半角 1 文字の幅（全角は 2 マス）
 PAD, BAR_H = 16, 28
 
-BG, BAR = (30, 30, 36), (52, 52, 60)
+# Windows Terminal（既定の配色 Campbell）に寄せる
+BG, BAR = (12, 12, 12), (32, 32, 32)
+WINDOW_TITLE = "Windows PowerShell"
 COLORS = {
-    "text": (220, 220, 220),
-    "title": (255, 214, 102),   # ■ ステップ名
-    "cmd": (126, 231, 135),     # > python …
-    "error": (255, 123, 114),   # 失敗・エラー
+    "text": (204, 204, 204),
+    "title": (97, 214, 214),    # ■ パターン名
+    "cmd": (249, 241, 165),     # PS C:\…> python …
+    "error": (231, 72, 86),     # 失敗・エラー
     "warn": (255, 170, 90),     # 警告・削除
-    "tree": (121, 192, 255),    # フォルダ表示
-    "dim": (140, 140, 150),     # 終了コード・補足
+    "tree": (110, 160, 255),    # フォルダ表示
+    "label": (214, 112, 214),   # 【実行前】【実行後】
+    "dim": (118, 118, 118),     # 終了コード・補足
 }
 
 TYPE_CHARS = 4      # コマンド行を 1 フレームで打ち込む文字数
@@ -91,14 +94,16 @@ def classify(text: str) -> str:
     s = text.strip()
     if s.startswith("■"):
         return "title"
-    if s.startswith("> python"):
+    if s.startswith("PS ") and "> python" in s:
         return "cmd"
+    if s.startswith("【"):
+        return "label"
     if text.startswith("    "):   # コマンドの出力（ステップの説明文は色分けしない）
         if "失敗" in s and not s.startswith("完了") or "見つかりません" in s or "エラー" in s:
             return "error"
         if "同じ名前になる" in s or "削除" in s or s.startswith("DRY-RUN"):
             return "warn"
-    if s.startswith(("📁", "├─", "└─", "│")) or s.endswith("/") or "（まだありません）" in s:
+    if s.startswith(("📁", "├─", "└─", "│")) or s in ("（まだありません）", "（空）"):
         return "tree"
     if s.startswith("（終了コード") or s.startswith("※"):
         return "dim"
@@ -140,22 +145,31 @@ def load_fonts(jp: str | None = None) -> Fonts:
 
 
 def frame(shown: list[Line], fonts: Fonts, title: str) -> Image.Image:
-    """表示中の行（最後の ROWS 行）を描いた 1 フレーム。"""
+    """表示中の行（最後の ROWS 行）を描いた 1 フレーム。見た目は Windows Terminal に寄せる。"""
     w = PAD * 2 + COLS * CELL_W
     h = BAR_H + PAD * 2 + ROWS * LINE_H
     img = Image.new("RGB", (w, h), BG)
     d = ImageDraw.Draw(img)
+    # タブの並ぶ帯と、選択中のタブ（背景と同じ色でつながって見える）
     d.rectangle((0, 0, w, BAR_H), fill=BAR)
-    for i, c in enumerate(((255, 95, 86), (255, 189, 46), (39, 201, 63))):
-        x = 14 + i * 20
-        d.ellipse((x, 9, x + 11, 20), fill=c)
-    fonts.draw(d, (w - width(title) * CELL_W) // 2, 5, title, COLORS["dim"])
+    tab_w = width(title) * CELL_W + 40
+    d.rounded_rectangle((8, 4, 8 + tab_w, BAR_H + 6), radius=6, fill=BG)
+    fonts.draw(d, 28, 6, title, COLORS["text"])
+    # 右上の 最小化・最大化・閉じる
+    fg, cy = COLORS["text"], BAR_H // 2
+    x = w - 130
+    d.line((x, cy, x + 10, cy), fill=fg)
+    x += 46
+    d.rectangle((x, cy - 5, x + 10, cy + 5), outline=fg)
+    x += 46
+    d.line((x, cy - 5, x + 10, cy + 5), fill=fg)
+    d.line((x, cy + 5, x + 10, cy - 5), fill=fg)
     for i, line in enumerate(shown[-ROWS:]):
         fonts.draw(d, PAD, BAR_H + PAD + i * LINE_H, line.text, COLORS[line.color])
     return img
 
 
-def render(lines: list[Line], out: Path, fonts: Fonts, title: str = "FileMove") -> int:
+def render(lines: list[Line], out: Path, fonts: Fonts, title: str = WINDOW_TITLE) -> int:
     """行の並びをアニメーション GIF にして保存し、フレーム数を返す。"""
     frames: list[Image.Image] = []
     durations: list[int] = []
@@ -195,7 +209,7 @@ def render(lines: list[Line], out: Path, fonts: Fonts, title: str = "FileMove") 
 
 
 def run_step(index: int, work: Path) -> str:
-    """demo.py の 1 ステップを実行して、その出力を返す。"""
+    """demo.py の 1 パターン（1 から数える）を実行して、その出力を返す。"""
     p = subprocess.run([sys.executable, str(HERE / "demo.py"), "--only", str(index), "--work", str(work)],
                        capture_output=True, text=True, encoding="utf-8", check=True,
                        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
@@ -207,18 +221,18 @@ def main(argv: list[str] | None = None) -> int:
     import demo  # noqa: E402  ステップ名と GIF のファイル名を取る
 
     ap = argparse.ArgumentParser(description="デモの各ステップを GIF にする")
-    ap.add_argument("steps", nargs="*", type=int, help="ステップ番号（省略時は全部）")
+    ap.add_argument("steps", nargs="*", type=int, help="パターンの番号 1〜（省略時は全部）")
     ap.add_argument("--out", type=Path, default=OUT_DIR, help="出力先フォルダ")
     ap.add_argument("--font", help="日本語に使うフォント（.ttf / .ttc）")
     args = ap.parse_args(argv)
 
     fonts = load_fonts(args.font)
-    wanted = args.steps or range(len(demo.STEPS))
+    wanted = args.steps or range(1, len(demo.STEPS) + 1)
     with tempfile.TemporaryDirectory() as tmp:
         for i in wanted:
-            title, _, _, gif = demo.STEPS[i]
+            gif = demo.STEPS[i - 1][3]
             out = args.out / f"demo_{gif}.gif"
-            n = render(parse(run_step(i, Path(tmp) / "work")), out, fonts, f"FileMove デモ {title.split()[0]}")
+            n = render(parse(run_step(i, Path(tmp) / "work")), out, fonts)
             print(f"{out.relative_to(Path.cwd()) if out.is_relative_to(Path.cwd()) else out}"
                   f"  {n} フレーム / {out.stat().st_size // 1024}KB")
     return 0
