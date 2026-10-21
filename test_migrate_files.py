@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-migrate_files.py のテスト（pytest）
+migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテストは test_gui.py
 
 実行:
     python -m pytest                    # 全件（単体テスト＋シナリオ）
@@ -13,6 +13,8 @@ migrate_files.py のテスト（pytest）
     - [P2] parse_size: 数値でないもの・単位なしの小数・未対応の単位（T）は ValueError（CLI では exit 2）
     - [P3] parse_since: 30d / 12h / 0d は now からの相対、YYYY-MM-DD は日付、空なら None
     - [P4] parse_since: 書式が不正（存在しない日付・単位違い・負数）なら ValueError
+    - [P5] make_filter / check_paths / start_message（CLI・GUI 共通）: 入力の文字列から絞り込み条件を作り、
+           移行先がファイル・移行元と同じなら ValueError。開始時の 1 行の文言
   transfer_file（1 ファイルの転送）
     - [T1] 正常にコピーでき、返り値の SHA-256 が移行元と一致し、.part が残らない
     - [T2] verify=False のときはハッシュを計算せず空文字を返す
@@ -44,12 +46,15 @@ migrate_files.py のテスト（pytest）
     - [D3] 削除に失敗したものは failures に入り、残りは続けて処理される
     - [D4] 対象は今回の移行でファイルを置くフォルダだけ。移行先の無関係なフォルダには触らない
     - [D5] ドライランでも、これから置く予定のファイルを含めて判定し、実行したときと結果が一致する
+    - [D6] run_migration(dedupe=True) で転送後に重複を削除し、result.dedupe に結果が入る。
+           削除に失敗したら result.ok が False になる
   進捗通知（ProgressEvent。GUI の進捗バーが依存する）
     - [E1] 最初に scanned（total 付き）、続いて 1 件ごとに done が index 1..total の順で届く
     - [E2] 既存ファイルのスキップ・台帳での済・失敗・ドライランがそれぞれの status で届き、
            failed には error が入る
     - [E3] 中止したら、それ以降の通知は届かない
-  デモ（demo/demo.py と、その GIF を作る demo/make_gif.py）
+    - [E4] --move で移行先に同じ内容があり移行元だけ消したものは removed で届く（ドライランでも）
+  CLI のデモ（demo/cli/demo.py と、その GIF を作る demo/cli/make_gif.py）
     - [G1] デモの全 12 パターンが指定した作業フォルダで最後まで動き、片付け・重複削除・指定ミス・
            ドライブ間の移動が期待どおりになる。表示には実際の作業フォルダのパスを出さない
     - [G2] --only N は PN だけを表示する（準備のコマンドは表示せずに実行する）
@@ -187,6 +192,27 @@ def test_P3_parse_since(value, expected):
 def test_P4_parse_since_invalid(value):
     with pytest.raises(ValueError, match="書式が不正"):
         mf.parse_since(value, now=NOW)
+
+
+def test_P5_make_filter_and_check_paths(tmp_path):
+    filt = mf.make_filter(ext=" PDF, .jpg ,", excludes=["*.tmp"], since="30d", min_size="1KB")
+    assert (filt.exts, filt.excludes, filt.min_size) == ({"pdf", "jpg"}, ("*.tmp",), 1024)
+    assert filt.since is not None
+    assert mf.make_filter(ext="  ").exts is None             # 空ならすべて
+    with pytest.raises(ValueError, match="書式が不正"):
+        mf.make_filter(since="あした")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("a", encoding="utf-8")
+    mf.check_paths([src], tmp_path / "dst")                  # 問題なし
+    with pytest.raises(ValueError, match="ディレクトリではありません"):
+        mf.check_paths([src], src / "a.txt")
+    with pytest.raises(ValueError, match="移行元と移行先が同じです"):
+        mf.check_paths([src / "a.txt"], src)
+
+    assert mf.start_message([src], tmp_path, move=True, dry_run=True) == f"移行開始: {src} -> {tmp_path}（移動／ドライラン）"
+    assert mf.start_message([src, src], tmp_path, move=False, dry_run=False).endswith("ほか 1 件 -> " + f"{tmp_path}（コピー）")
 
 
 # ================================================================ transfer_file
@@ -571,6 +597,25 @@ def test_D5_dedupe_dry_run_includes_planned_files(tmp_path):
     assert mf.remove_duplicates(real.dest_dirs, root=dst).removed == preview.removed
 
 
+def test_D6_run_migration_with_dedupe(tmp_path, unlink_fails_on):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    for name in ("a.txt", "a (1).txt", "b.txt", "b (1).txt"):
+        (src / name).write_text(name[0], encoding="utf-8")
+
+    preview = mf.run_migration(src, dst, dry_run=True, dedupe=True)
+    assert (preview.dedupe.removed, preview.ok) == (2, True)
+    assert not dst.exists()
+    assert mf.run_migration(src, tmp_path / "plain").dedupe is None   # dedupe なしなら None
+
+    unlink_fails_on("b (1).txt")
+    result = mf.run_migration(src, dst, dedupe=True)
+    assert result.dedupe.removed == 1
+    assert result.dedupe.failures == [("b (1).txt", "使用中です")]
+    assert not result.ok           # 重複の削除に失敗したら ok ではない（CLI は exit 1）
+    assert _names(dst) == ["a.txt", "b (1).txt", "b.txt"]
+
+
 # ================================================================ 進捗通知
 
 def _collect(src, dst, **kw) -> list[tuple]:
@@ -619,9 +664,19 @@ def test_E3_no_events_after_cancel(tree):
     assert got == [("scanned", 0, 3, ""), ("done", 1, 3, "a.txt")]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_E4_removed_status(tree, dry_run):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")   # 同じ内容が移行先にある
+
+    got, _ = _collect(src, dst, move=True, dry_run=dry_run)
+
+    assert [g[0] for g in got] == ["scanned", "removed", *(["dryrun"] * 2 if dry_run else ["done"] * 2)]
+
+
 # ================================================================ デモ
 
-DEMO = ROOT / "demo"
+DEMO = ROOT / "demo" / "cli"
 
 
 def _run_demo(*args: str) -> str:
