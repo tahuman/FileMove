@@ -4,8 +4,8 @@
 demo.py の各パターンを、Windows Terminal 風のアニメーション GIF にする。
 
     python -m pip install -r requirements-dev.txt   # Pillow が必要
-    python demo/make_gif.py              # 全パターン -> docs/images/demo_p*.gif
-    python demo/make_gif.py 1 3          # 指定したパターンだけ（P1 と P3）
+    python demo/cli/make_gif.py          # 全パターン -> docs/images/cli/demo_p*.gif
+    python demo/cli/make_gif.py 1 3      # 指定したパターンだけ（P1 と P3）
 
 demo.py をパターンごとに --only で実行し、その出力を描画する。
 コマンド行（"PS C:\\…> python …"）は 1 文字ずつ打ち込むように、それ以外は 1 行ずつ表示する。
@@ -26,7 +26,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 
 HERE = Path(__file__).resolve().parent
-OUT_DIR = HERE.parent / "docs" / "images"
+OUT_DIR = HERE.parent.parent / "docs" / "images" / "cli"
 
 # 日本語用と英数字用のフォント（それぞれ見つかった最初のもの）。
 # 日本語フォントだけだと "~" が上線のように見えるので、英数字は別のフォントで描く

@@ -1,2 +1,2 @@
 pytest>=8
-Pillow>=10   # demo/make_gif.py（デモの GIF 作成）
+Pillow>=10   # デモの GIF 作成（demo/cli/make_gif.py、demo/gui/demo_gui.py の画面の撮影）

@@ -1,53 +1,36 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FileMove のデモ。「ダウンロードにたまったファイルを、デスクトップへ移して整理する」という
+FileMove の CLI のデモ。「ダウンロードにたまったファイルを、デスクトップへ移して整理する」という
 場面で、使い方のパターン（P1〜P12）を順番に実行して見せる。
 
-    python demo/demo.py            # 1 パターンごとに Enter で進む
-    python demo/demo.py --auto     # 止まらずに最後まで流す
-    python demo/demo.py --only 3   # P3 だけ表示する
+    python demo/cli/demo.py            # 1 パターンごとに Enter で進む
+    python demo/cli/demo.py --auto     # 止まらずに最後まで流す
+    python demo/cli/demo.py --only 3   # P3 だけ表示する
 
-パターンごとにサンプルを作り直すので、どれも単独で実行できる。
-demo/work/（--work で変更可）以外には何も書き込まない。
+パターンごとにサンプル（demo/sample.py）を作り直すので、どれも単独で実行できる。
+demo/work/cli/（--work で変更可）以外には何も書き込まない。
 表示上のパスは Windows の形（C:\\Users\\user\\Downloads、D:\\写真）にしているが、
-実際には作業フォルダの中で実行している。GIF にするには demo/make_gif.py を使う。
+実際には作業フォルダの中で実行している。GIF にするには demo/cli/make_gif.py を使う。
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SCRIPT = HERE.parent / "migrate_files.py"
-WORK = HERE / "work"
-DAY = 86400
+SCRIPT = HERE.parent.parent / "migrate_files.py"
+sys.path.insert(0, str(HERE.parent))   # demo/sample.py を読む
 
-HOME_SHOWN, D_SHOWN = "C:\\Users\\user", "D:"
+from sample import D_SHOWN, HOME_SHOWN, Sample  # noqa: E402
+
+WORK = HERE.parent / "work" / "cli"
 PROMPT = f"PS {HOME_SHOWN}>"
-
-# (ホームからのパス, 内容, 何日前に更新されたか)。ふだん使う拡張子だけにする
-SAMPLE = [
-    ("Downloads/見積書_A社.pdf",    "見積書 A社\n" * 300,   3),
-    ("Downloads/請求書_10月.pdf",   "請求書 10月\n" * 200,  7),
-    ("Downloads/見積書_2025.pdf",   "見積書 2025\n" * 300, 200),
-    ("Downloads/売上_2026.xlsx",    "売上\n" * 800,         2),
-    ("Downloads/議事録.docx",       "議事録\n" * 400,       5),
-    ("Downloads/メモ.txt",          "買い物リスト\n",        1),
-    ("Downloads/IMG_0001.jpg",      "JPEG 0001" * 3000,    10),
-    ("Downloads/IMG_0001 (1).jpg",  "JPEG 0001" * 3000,    10),   # 同じ写真を 2 回ダウンロードした
-    ("Downloads/IMG_0002.jpg",      "JPEG 0002" * 3500,    10),
-    ("Pictures/旅行/海_01.jpg",     "JPEG 海01" * 5000,    60),
-    ("Pictures/旅行/海_02.jpg",     "JPEG 海02" * 5000,    60),
-    ("Pictures/旅行/山_01.jpg",     "JPEG 山01" * 4000,    60),
-]
-EMPTY_DIRS = ["Desktop"]
+ENV = Sample(WORK)
 
 STEPS = []
 QUIET = False  # True の間は何も表示しない（準備のコマンドを黙って実行するため）
@@ -55,7 +38,7 @@ QUIET = False  # True の間は何も表示しない（準備のコマンドを�
 
 def step(title: str, note: str, gif: str, extra: list | None = None):
     """デモの 1 パターン。title は「何をしたいか」の 1 行、gif は make_gif.py が出力するファイル名、
-    extra はこのパターンだけ追加で置くサンプル（SAMPLE と同じ形）。"""
+    extra はこのパターンだけ追加で置くサンプル（demo/sample.py の SAMPLE と同じ形）。"""
     def deco(fn):
         STEPS.append((title, note, fn, gif, extra or []))
         return fn
@@ -65,23 +48,17 @@ def step(title: str, note: str, gif: str, extra: list | None = None):
 # ---------------------------------------------------------------- パスの表示
 
 def home() -> Path:
-    return WORK / "Users" / "user"
+    return ENV.home
 
 
 def real(shown: str) -> Path:
     """表示上のパス（C:\\Users\\user\\… / D:\\… / ホームからの相対）を、作業フォルダ内の実際のパスにする。"""
-    if shown.startswith(HOME_SHOWN):
-        base, rest = home(), shown[len(HOME_SHOWN):]
-    elif shown.startswith(D_SHOWN):
-        base, rest = WORK / "D", shown[len(D_SHOWN):]
-    else:
-        base, rest = home(), shown
-    return base.joinpath(*[p for p in rest.split("\\") if p])
+    return ENV.real(shown)
 
 
 def to_shown(text: str) -> str:
     """出力に含まれる実際のパスを、表示上のパスに戻す。"""
-    return text.replace(str(WORK / "D"), D_SHOWN).replace(str(home()), HOME_SHOWN)
+    return ENV.shown(text)
 
 
 # ---------------------------------------------------------------- 表示まわり
@@ -129,7 +106,7 @@ def run(*args: str) -> None:
     actual = [str(real(a)) if a.startswith((HOME_SHOWN, D_SHOWN)) else a.replace("\\", os.sep)
               for a in args]
     p = subprocess.run([sys.executable, str(SCRIPT), *actual,
-                        "--log", str(WORK / "migration.log"), "--ledger", str(WORK / "ledger.jsonl")],
+                        "--log", str(ENV.work / "migration.log"), "--ledger", str(ENV.work / "ledger.jsonl")],
                        cwd=home(), capture_output=True, text=True, encoding="utf-8",
                        env={**os.environ, "PYTHONIOENCODING": "utf-8"})
     for line in (p.stdout + p.stderr).splitlines():
@@ -269,43 +246,28 @@ def p12():
 
 # ---------------------------------------------------------------- 本体
 
-def build_sample(extra: list) -> None:
-    if WORK.exists():
-        shutil.rmtree(WORK)
-    (WORK / "D").mkdir(parents=True)
-    for d in EMPTY_DIRS:
-        (home() / d).mkdir(parents=True, exist_ok=True)
-    now = time.time()
-    for rel, body, days in SAMPLE + extra:
-        p = home() / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(body, encoding="utf-8")
-        t = now - days * DAY
-        os.utime(p, (t, t))
-
-
 def main(argv: list[str] | None = None) -> int:
-    global WORK
-    ap = argparse.ArgumentParser(description="FileMove のデモ")
+    global ENV
+    ap = argparse.ArgumentParser(description="FileMove の CLI のデモ")
     ap.add_argument("--auto", action="store_true", help="Enter を待たずに最後まで流す")
     ap.add_argument("--only", type=int, metavar="N", help=f"P{{N}} だけ表示する（1〜{len(STEPS)}）")
     ap.add_argument("--work", type=Path, default=WORK, help="作業フォルダ（毎回作り直す）")
     args = ap.parse_args(argv)
     if args.only is not None and not 1 <= args.only <= len(STEPS):
         ap.error(f"--only は 1〜{len(STEPS)} で指定してください")
-    WORK = args.work.resolve()
+    ENV = Sample(args.work)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(errors="backslashreplace")  # 出力をファイルに書き出しても止まらない
 
     if args.only is None:
         say("=" * 64)
-        say("  FileMove デモ（ダウンロード → デスクトップの整理）")
-        say(f"  作業フォルダ: {WORK}")
+        say("  FileMove CLI デモ（ダウンロード → デスクトップの整理）")
+        say(f"  作業フォルダ: {ENV.work}")
         say("=" * 64)
 
     chosen = [STEPS[args.only - 1]] if args.only else STEPS
     for i, (title, note, fn, _, extra) in enumerate(chosen):
-        build_sample(extra)
+        ENV.build(extra)
         say(f"\n■ {title}")
         say(f"  {note}")
         fn()
@@ -318,7 +280,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.only is None:
         say("\nデモは以上です。作業フォルダの中身は自由に触って確かめてください。")
-        say("使い方の詳細は docs/MANUAL.md を参照してください。")
+        say("使い方の詳細は docs/cli/MANUAL.md を参照してください。")
     return 0
 
 

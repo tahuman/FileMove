@@ -342,6 +342,7 @@ class ProgressEvent:
     """進捗通知。GUI や別の UI から購読できるよう、表示に必要な情報だけを持つ。
 
     status は "scanned"（走査完了・総数の通知）/ "done" / "skipped" /
+    "removed"（--move で移行先に同じ内容があり、移行元だけ削除した。ドライランでは削除する予定）/
     "failed" / "dryrun" のいずれか。
     """
     status: str
@@ -368,7 +369,7 @@ class MigrationResult:
 
     @property
     def ok(self) -> bool:
-        return self.failed == 0 and not self.cancelled
+        return self.failed == 0 and not self.cancelled and not (self.dedupe and self.dedupe.failures)
 
 
 @dataclass
@@ -418,6 +419,7 @@ def run_migration(src, dst, *,
                   verify: bool = True,
                   on_exists: str = "skip",
                   dry_run: bool = False,
+                  dedupe: bool = False,
                   ledger: Ledger | None = None,
                   log: logging.Logger | None = None,
                   progress: Callable[[ProgressEvent], None] | None = None,
@@ -459,7 +461,8 @@ def run_migration(src, dst, *,
     exists = lambda p: p.exists() or _root_id(p) in placed  # noqa: E731
 
     def drop_source(i: int, t: _Target) -> bool:
-        """移行先に同じ内容がある移行元を削除する。失敗したら failed として扱い False を返す。"""
+        """移行先に同じ内容がある移行元を削除する（skipped として数える）。
+        失敗したら failed として扱い False を返す。"""
         if not dry_run:
             try:
                 t.path.unlink()
@@ -469,9 +472,11 @@ def run_migration(src, dst, *,
                 log.error("[%d/%d] 移行元を削除できません %s: %s", i, total, t.shown, e)
                 emit(ProgressEvent("failed", i, total, t.rel, error=str(e)))
                 return False
+        result.skipped += 1
         result.sources_removed += 1
         log.info("[%d/%d] %s移行先に同じ内容があるため移行元を削除: %s",
                  i, total, "DRY-RUN " if dry_run else "", t.shown)
+        emit(ProgressEvent("removed", i, total, t.rel))
         return True
 
     for i, t in enumerate(targets, 1):
@@ -540,6 +545,9 @@ def run_migration(src, dst, *,
             log.error("[%d/%d] 失敗 %s: %s", i, total, shown, e)
             emit(ProgressEvent("failed", i, total, rel, error=str(e)))
 
+    if dedupe and not result.cancelled:
+        result.dedupe = remove_duplicates(result.dest_dirs, root=dst, planned=result.placed,
+                                          dry_run=dry_run, log=log)
     result.elapsed = time.time() - started
     return result
 
@@ -646,6 +654,32 @@ def expand_sources(args: Sequence[str]) -> list[Path]:
     return sources
 
 
+def check_paths(sources: Sequence[Path], dst: Path) -> None:
+    """移行元と移行先の組み合わせを確かめる。問題があれば ValueError（CLI・GUI 共通）。"""
+    if dst.exists() and not dst.is_dir():
+        raise ValueError(f"移行先がディレクトリではありません: {dst}")
+    for src in sources:
+        # ファイルの場合は、そのファイルがあるディレクトリを移行先にすると自分自身に転送してしまう
+        src_dir = src if src.is_dir() else src.parent
+        if src_dir.resolve() == dst.resolve():
+            raise ValueError(f"移行元と移行先が同じです: {src}")
+
+
+def start_message(sources: Sequence[Path], dst: Path, *, move: bool, dry_run: bool) -> str:
+    """実行の最初にログへ出す 1 行（CLI・GUI 共通）。"""
+    shown_src = str(sources[0]) + (f" ほか {len(sources) - 1} 件" if len(sources) > 1 else "")
+    return f"移行開始: {shown_src} -> {dst}（{'移動' if move else 'コピー'}{'／ドライラン' if dry_run else ''}）"
+
+
+def make_filter(ext: str | None = None, excludes: Sequence[str] = (), since: str | None = None,
+                min_size: str | None = None, max_size: str | None = None) -> FileFilter:
+    """入力された文字列（"pdf,jpg"、"30d"、"10MB" など）から絞り込み条件を作る。
+    書式が不正なら ValueError（CLI・GUI 共通）。"""
+    exts = [e.strip() for e in ext.split(",") if e.strip()] if ext and ext.strip() else None
+    return FileFilter(exts=exts, excludes=excludes, since=parse_since(since),
+                      min_size=parse_size(min_size), max_size=parse_size(max_size))
+
+
 def setup_logging(log_path: Path | None, verbose: bool) -> None:
     LOGGER.setLevel(logging.DEBUG if verbose else logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
@@ -705,27 +739,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     dst = Path(args.paths[-1])
     try:
         sources = expand_sources(args.paths[:-1])
-    except ValueError as e:
-        LOGGER.error("%s", e)
-        return 2
-    if dst.exists() and not dst.is_dir():
-        LOGGER.error("移行先がディレクトリではありません: %s", dst)
-        return 2
-    for src in sources:
-        # ファイルの場合は、そのファイルがあるディレクトリを移行先にすると自分自身に転送してしまう
-        src_dir = src if src.is_dir() else src.parent
-        if src_dir.resolve() == dst.resolve():
-            LOGGER.error("移行元と移行先が同じです: %s", src)
-            return 2
-
-    try:
-        filt = FileFilter(
-            exts=args.ext.split(",") if args.ext else None,
-            excludes=args.exclude or (),
-            since=parse_since(args.since),
-            min_size=parse_size(args.min_size),
-            max_size=parse_size(args.max_size),
-        )
+        check_paths(sources, dst)
+        filt = make_filter(args.ext, args.exclude or (), args.since, args.min_size, args.max_size)
     except ValueError as e:
         LOGGER.error("%s", e)
         return 2
@@ -733,15 +748,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     ledger = Ledger(None if (args.dry_run or args.restart) else args.ledger)
 
     LOGGER.info("=" * 60)
-    shown_src = str(sources[0]) + (f" ほか {len(sources) - 1} 件" if len(sources) > 1 else "")
-    LOGGER.info("移行開始: %s -> %s（%s%s）", shown_src, dst,
-                "移動" if args.move else "コピー", "／ドライラン" if args.dry_run else "")
+    LOGGER.info("%s", start_message(sources, dst, move=args.move, dry_run=args.dry_run))
 
     try:
         result = run_migration(
             sources, dst, filt=filt, move=args.move,
             verify=not args.no_verify, on_exists=args.on_exists,
-            dry_run=args.dry_run, ledger=ledger, log=LOGGER)
+            dry_run=args.dry_run, dedupe=args.dedupe, ledger=ledger, log=LOGGER)
     except KeyboardInterrupt:
         LOGGER.warning("中断されました。同じコマンドを再実行すると続きから再開します。")
         return 2
@@ -774,7 +787,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if result.cancelled:
         return 2
-    return 0 if result.failed == 0 and not dedupe.failures else 1
+    return 0 if result.ok else 1
 
 
 if __name__ == "__main__":
