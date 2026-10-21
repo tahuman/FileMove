@@ -67,7 +67,8 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | 8 | 7 の直後に同じコマンドを再実行 | 成功 0・スキップ 24、「うち台帳で処理済みとしてスキップ 22 件」と表示 |
 | 9 | `--on-exists rename` | 成功 24。`same_1.txt` と `renamed_2.txt`（_1 は既存のため）が `NEW (src)` で作られる |
 | 10 | `--on-exists overwrite` | 成功 24。`same.txt` が `NEW (src)` に置き換わる |
-| 11 | `--ledger $W/ledger_partial.jsonl` | 成功 20・スキップ 4（done の 2 件＋衝突 2 件）、「うち台帳で処理済み 2 件」。failed/skipped 記録の sales.xlsx・photo1.jpg、別の移行・旧形式の記録しかない empty_file.txt・no_extension・archive.tar.gz はコピーされる。壊れた行でエラーにならない |
+| 11 | `--ledger $W/ledger_partial.jsonl` | 成功 22・スキップ 2（衝突 2 件）。done の記録がある report_2025.pdf・sales.csv は、移行先に見当たらないので「転送し直します」と表示してコピーする。failed/skipped 記録の sales.xlsx・photo1.jpg、別の移行・旧形式の記録しかない empty_file.txt・no_extension・archive.tar.gz もコピーされる。壊れた行でエラーにならない |
+| 11b | 11 の直後に同じコマンドを再実行 | 成功 0・スキップ 24、「うち台帳で処理済みとしてスキップ 22 件」 |
 | 12 | `--restart --ledger $W/ledger_partial.jsonl` | 台帳を無視して 1 と同じく成功 22・スキップ 2 |
 | 13 | `--move` | 成功 22・スキップ 2。src に残るのは conflict/same.txt と conflict/renamed.txt のみ |
 | 14 | dst を `$W/src/_migrated` にする（2 回実行、2 回目は別台帳） | 1 回目 成功 24。2 回目も対象 24 件のまま（_migrated 配下を辿らない）でスキップ 24 |
@@ -125,13 +126,19 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 
 ## 重複ファイルの削除（--dedupe）
 
-転送の後、移行先で `name (1).ext` のような番号付きのファイルが、同じフォルダの `name.ext` と同じ内容なら削除する。
-データは `run_scenarios.py` が `$W/dup/` に作る（`in/new.txt`、`out/` に `report.txt`・`report (1).txt`（同じ内容）・`report (2).txt`（中身違い）・`memo (1).txt`（元なし））。
+転送の後、今回ファイルを置く移行先のフォルダ（サブフォルダはたどらない）で、`name (1).ext` のような番号付きのファイルが、同じフォルダの `name.ext` と同じ内容なら削除する。
+データは `run_scenarios.py` が `$W/dup/` に作る。
+- `in/new.txt`
+- `out/` 直下: `report.txt`・`report (1).txt`（同じ内容）・`report (2).txt`（中身違い）・`memo (1).txt`（元なし）
+- `out/私物/`: `写真.jpg`・`写真 (1).jpg`（同じ内容。今回の移行とは関係ないフォルダ）
+- `in2/`: `a.txt`・`a (1).txt`（同じ内容）
 
-| # | コマンド（`$W/dup/in $W/dup/out` に追加） | 期待結果 |
+| # | コマンド | 期待結果 |
 |---|---|---|
-| D1 | `--dedupe` | 成功 1、「重複ファイルの削除: 1 件」。`report (1).txt` だけ消え、`report (2).txt`・`memo (1).txt` は残る |
-| D2 | `--dedupe --dry-run` | 「DRY-RUN 重複を削除: report (1).txt」と表示され、何も消えない |
+| D1 | `$W/dup/in $W/dup/out --dedupe` | 成功 1、「重複ファイルの削除: 1 件」。`report (1).txt` だけ消え、`report (2).txt`・`memo (1).txt` は残る。`私物/写真 (1).jpg` も残る（今回の移行と関係ないフォルダ） |
+| D2 | D1 に `--dry-run` | 「DRY-RUN 重複を削除: report (1).txt」と表示され、何も消えない |
+| D3 | `$W/dup/in2 $W/dup/new --dedupe --dry-run`（移行先はまだ無い） | これからコピーする 2 ファイルも含めて判定し、「DRY-RUN 重複を削除: a (1).txt」と表示する。`new/` は作られない |
+| D3b | D3 から `--dry-run` を外して実行 | 成功 2 の後に `a (1).txt` が消え、`new/` には `a.txt` だけが残る（ドライランの表示と一致） |
 
 ## このデータでは確認できないもの
 

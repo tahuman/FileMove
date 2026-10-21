@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-migrate_files.py のテスト（pytest）
+migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテストは test_gui.py
 
 実行:
     python -m pytest                    # 全件（単体テスト＋シナリオ）
@@ -13,6 +13,8 @@ migrate_files.py のテスト（pytest）
     - [P2] parse_size: 数値でないもの・単位なしの小数・未対応の単位（T）は ValueError（CLI では exit 2）
     - [P3] parse_since: 30d / 12h / 0d は now からの相対、YYYY-MM-DD は日付、空なら None
     - [P4] parse_since: 書式が不正（存在しない日付・単位違い・負数）なら ValueError
+    - [P5] make_filter / check_paths / start_message（CLI・GUI 共通）: 入力の文字列から絞り込み条件を作り、
+           移行先がファイル・移行元と同じなら ValueError。開始時の 1 行の文言
   transfer_file（1 ファイルの転送）
     - [T1] 正常にコピーでき、返り値の SHA-256 が移行元と一致し、.part が残らない
     - [T2] verify=False のときはハッシュを計算せず空文字を返す
@@ -26,26 +28,38 @@ migrate_files.py のテスト（pytest）
     - [R2] 最初から中止なら 1 件も転送しない
     - [R3] 1 件の転送失敗で全体は止まらず、failures に記録され、台帳は failed になる
     - [R4] failed は次回の実行で再試行され、done は台帳で処理済みとしてスキップされる
+    - [R5] 台帳で done でも、移行先から消えていれば転送し直す（コピー・--move とも）
+    - [R6] 台帳の dest は絶対パスで記録し、旧版の相対パスの記録は移行先/相対パスで照合する
+    - [C1] 標準出力が cp932（出力をファイルに書き出したとき）でも、絵文字のファイル名でログが壊れない
   --move の移行元の片付け
     - [V1] same_content: 中身が同じなら True。中身・サイズが違う、どちらかが無いなら False
     - [V2] 移行先に同じ内容があれば転送せず移行元を削除し、台帳は done。中身が違えば移行元は残る
-    - [V3] コピー済み（台帳で done）を後から --move すると移行元が消える。rename 先（台帳の dest）も照合する
+    - [V3] コピー済み（台帳で done）を後から --move すると移行元が消える。rename 先（台帳の dest）も照合する。
+           片付けたものは「台帳で処理済み」には数えない
     - [V4] ドライランでは移行元を消さずに件数だけ数える
     - [V5] 移行元の削除に失敗したら failed になり、残りは続けて処理される
   重複ファイルの削除（--dedupe）
     - [D1] find_duplicates: `name (n).ext` で同じフォルダの `name.ext` と同じ内容のものだけを返す
-           （中身が違う・元が無い・番号なしのものは対象外。全角括弧・多重拡張子・サブフォルダも扱う）
+           （中身が違う・元が無い・番号なしのものは対象外。全角括弧・多重拡張子も扱う。
+           渡したフォルダだけを見て、サブフォルダはたどらない）
     - [D2] remove_duplicates: 重複だけを消し、ドライランでは消さない。`(1) (1)` の連鎖でも元は残る
     - [D3] 削除に失敗したものは failures に入り、残りは続けて処理される
+    - [D4] 対象は今回の移行でファイルを置くフォルダだけ。移行先の無関係なフォルダには触らない
+    - [D5] ドライランでも、これから置く予定のファイルを含めて判定し、実行したときと結果が一致する
+    - [D6] run_migration(dedupe=True) で転送後に重複を削除し、result.dedupe に結果が入る。
+           削除に失敗したら result.ok が False になる
   進捗通知（ProgressEvent。GUI の進捗バーが依存する）
     - [E1] 最初に scanned（total 付き）、続いて 1 件ごとに done が index 1..total の順で届く
     - [E2] 既存ファイルのスキップ・台帳での済・失敗・ドライランがそれぞれの status で届き、
            failed には error が入る
     - [E3] 中止したら、それ以降の通知は届かない
-  デモ（demo/demo.py と、その GIF を作る demo/make_gif.py）
-    - [G1] デモの全ステップが指定した作業フォルダで最後まで動き、⑧ の片付けと ⑨ の重複削除が効く
-    - [G2] --only N は N 番目のステップだけを表示する（前のステップは黙って実行される）
-    - [G3] make_gif: 全角を 2 桁として折り返し、コマンド・見出し・出力の種類で色を分ける
+    - [E4] --move で移行先に同じ内容があり移行元だけ消したものは removed で届く（ドライランでも）
+  CLI のデモ（demo/cli/demo.py と、その GIF を作る demo/cli/make_gif.py）
+    - [G1] デモの全 12 パターンが指定した作業フォルダで最後まで動き、片付け・重複削除・指定ミス・
+           ドライブ間の移動が期待どおりになる。表示には実際の作業フォルダのパスを出さない
+    - [G2] --only N は PN だけを表示する（準備のコマンドは表示せずに実行する）
+    - [G3] make_gif: 全角を 2 桁として折り返し、コマンド（PS プロンプト）・見出し・出力・
+           【実行前／後】・フォルダ表示の種類で色を分ける
     - [G4] make_gif: 行の並びから、複数フレームのループする GIF を作る（フォントが無い環境では skip）
   シナリオ（CLI 経由。testdata/SCENARIOS.md の表を testdata/run_scenarios.py で実行）
     - [S] 全シナリオ。前のシナリオの結果を使うもの（reset=False）は、前提から続けて実行する
@@ -57,7 +71,9 @@ import hashlib
 import importlib.util
 import os
 import subprocess
+import sys
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -176,6 +192,27 @@ def test_P3_parse_since(value, expected):
 def test_P4_parse_since_invalid(value):
     with pytest.raises(ValueError, match="書式が不正"):
         mf.parse_since(value, now=NOW)
+
+
+def test_P5_make_filter_and_check_paths(tmp_path):
+    filt = mf.make_filter(ext=" PDF, .jpg ,", excludes=["*.tmp"], since="30d", min_size="1KB")
+    assert (filt.exts, filt.excludes, filt.min_size) == ({"pdf", "jpg"}, ("*.tmp",), 1024)
+    assert filt.since is not None
+    assert mf.make_filter(ext="  ").exts is None             # 空ならすべて
+    with pytest.raises(ValueError, match="書式が不正"):
+        mf.make_filter(since="あした")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.txt").write_text("a", encoding="utf-8")
+    mf.check_paths([src], tmp_path / "dst")                  # 問題なし
+    with pytest.raises(ValueError, match="ディレクトリではありません"):
+        mf.check_paths([src], src / "a.txt")
+    with pytest.raises(ValueError, match="移行元と移行先が同じです"):
+        mf.check_paths([src / "a.txt"], src)
+
+    assert mf.start_message([src], tmp_path, move=True, dry_run=True) == f"移行開始: {src} -> {tmp_path}（移動／ドライラン）"
+    assert mf.start_message([src, src], tmp_path, move=False, dry_run=False).endswith("ほか 1 件 -> " + f"{tmp_path}（コピー）")
 
 
 # ================================================================ transfer_file
@@ -302,6 +339,65 @@ def test_R4_retry_failed_with_ledger(tree, tmp_path, fail_on):
     assert (dst / "b.txt").read_text(encoding="utf-8") == "b.txt"
 
 
+@pytest.mark.parametrize("move", [False, True])
+def test_R5_retransfer_when_dest_missing(tree, tmp_path, move, caplog):
+    src, dst = tree
+    ledger_path = tmp_path / "ledger.jsonl"
+    first = mf.Ledger(ledger_path)
+    mf.run_migration(src, dst, ledger=first)
+    first.close()
+    (dst / "b.txt").unlink()   # コピーした後に移行先から消えた
+
+    second = mf.Ledger(ledger_path)
+    with caplog.at_level("INFO", logger="migrate"):
+        result = mf.run_migration(src, dst, move=move, ledger=second)
+    second.close()
+
+    assert result.copied == 1
+    assert "移行先に見当たらないため転送し直します: b.txt" in caplog.text
+    assert (dst / "b.txt").read_text(encoding="utf-8") == "b.txt"
+    assert _names(src) == ([] if move else ["a.txt", "b.txt", "c.txt"])
+
+
+def test_R6_ledger_dest_is_absolute(tree, tmp_path, monkeypatch):
+    src, dst = tree
+    monkeypatch.chdir(tmp_path)
+    ledger_path = tmp_path / "ledger.jsonl"
+    first = mf.Ledger(ledger_path)
+    mf.run_migration(Path("src"), Path("dst"), ledger=first)   # 相対パスで実行
+    first.close()
+
+    second = mf.Ledger(ledger_path)
+    second.bind(src, dst)
+    assert all(Path(second.get(n)["dest"]).is_absolute() for n in ("a.txt", "b.txt", "c.txt"))
+
+    # 旧版の台帳（dest が相対パス）は、別の場所から実行しても移行先/相対パスで照合する
+    second.record("a.txt", "done", dest="dst/a.txt")
+    monkeypatch.chdir(src)
+    result = mf.run_migration(src, dst, move=True, ledger=second)
+    second.close()
+
+    assert result.sources_removed == 3
+    assert _names(src) == []
+
+
+@pytest.mark.scenario
+def test_C1_output_to_cp932_file(tmp_path):
+    (tmp_path / "e").mkdir()
+    (tmp_path / "e" / "🍣.txt").write_text("x", encoding="utf-8")
+
+    # 出力をファイルに書き出したときと同じく、標準出力を cp932 にして実行する
+    p = subprocess.run([sys.executable, str(ROOT / "migrate_files.py"), "e", "out",
+                        "--log", "m.log", "--ledger", "l.jsonl"],
+                       cwd=tmp_path, capture_output=True, env={**os.environ, "PYTHONIOENCODING": "cp932"})
+    out = p.stdout.decode("cp932") + p.stderr.decode("cp932", "replace")
+
+    assert p.returncode == 0, out
+    assert "Logging error" not in out
+    assert "\\U0001f363.txt" in out                                   # 画面には置き換えて出す
+    assert "🍣.txt" in (tmp_path / "m.log").read_text(encoding="utf-8")  # ログファイルはそのまま
+
+
 # ================================================================ --move の移行元の片付け
 
 @pytest.fixture
@@ -362,7 +458,8 @@ def test_V3_move_after_copy_uses_ledger(tree, tmp_path):
     result = mf.run_migration(src, dst, move=True, ledger=second)
     second.close()
 
-    assert (result.copied, result.already_done, result.sources_removed) == (0, 3, 3)
+    # 片付けたものは「台帳で処理済みとしてスキップ」には数えない（--restart の案内を出さない）
+    assert (result.copied, result.skipped, result.already_done, result.sources_removed) == (0, 3, 0, 3)
     assert _names(src) == []
     assert (dst / "a.txt").read_text(encoding="utf-8") == "既存"
 
@@ -425,27 +522,33 @@ def _rels(root: Path) -> set[str]:
     return {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
 
 
+def _dirs(root: Path) -> list[Path]:
+    return [root, *sorted(p for p in root.rglob("*") if p.is_dir())]
+
+
 DUPLICATES = {"report (1).txt", "report(3).txt", "archive (1).tar.gz", "sub/写真（1）.jpg",
               "a (1).txt", "a (1) (1).txt"}
 
 
 def test_D1_find_duplicates(dups):
-    pairs = mf.find_duplicates(dups)
+    pairs = mf.find_duplicates(_dirs(dups))
 
     got = {d.relative_to(dups).as_posix(): o.name for d, o in pairs}
     assert got == {"report (1).txt": "report.txt", "report(3).txt": "report.txt",
                    "archive (1).tar.gz": "archive.tar.gz", "sub/写真（1）.jpg": "写真.jpg",
                    "a (1).txt": "a.txt", "a (1) (1).txt": "a (1).txt"}
+    # 渡したフォルダだけを見る（サブフォルダはたどらない）
+    assert {d.name for d, _ in mf.find_duplicates([dups / "sub"])} == {"写真（1）.jpg"}
 
 
 def test_D2_remove_duplicates(dups):
     before = _rels(dups)
 
-    preview = mf.remove_duplicates(dups, dry_run=True)
+    preview = mf.remove_duplicates(_dirs(dups), root=dups, dry_run=True)
     assert preview.removed == len(DUPLICATES)
     assert _rels(dups) == before
 
-    result = mf.remove_duplicates(dups)
+    result = mf.remove_duplicates(_dirs(dups), root=dups)
     assert result.removed == len(DUPLICATES)
     assert result.bytes_freed == sum(len(n) for n in ("same", "same", "gz", "jpg", "chain", "chain"))
     assert _rels(dups) == before - DUPLICATES
@@ -455,11 +558,62 @@ def test_D2_remove_duplicates(dups):
 def test_D3_remove_duplicates_failure(dups, unlink_fails_on):
     unlink_fails_on("report (1).txt")
 
-    result = mf.remove_duplicates(dups)
+    result = mf.remove_duplicates(_dirs(dups), root=dups)
 
     assert result.failures == [("report (1).txt", "使用中です")]
     assert result.removed == len(DUPLICATES) - 1
     assert (dups / "report (1).txt").exists()
+
+
+def test_D4_dedupe_only_folders_of_this_run(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    for rel, body in {"src/写真/new.jpg": "new", "dst/写真/a.jpg": "a", "dst/写真/a (1).jpg": "a",
+                      "dst/私物/b.jpg": "b", "dst/私物/b (1).jpg": "b"}.items():
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text(body, encoding="utf-8")
+
+    migrated = mf.run_migration(src, dst)
+    result = mf.remove_duplicates(migrated.dest_dirs, root=dst)
+
+    assert migrated.dest_dirs == [dst / "写真"]
+    assert result.removed == 1
+    assert not (dst / "写真/a (1).jpg").exists()
+    assert (dst / "私物/b (1).jpg").exists()   # 今回の移行と関係ないフォルダには触らない
+
+
+def test_D5_dedupe_dry_run_includes_planned_files(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    for name in ("a.txt", "a (1).txt"):
+        (src / name).write_text("same", encoding="utf-8")
+
+    migrated = mf.run_migration(src, dst, dry_run=True)
+    preview = mf.remove_duplicates(migrated.dest_dirs, root=dst, planned=migrated.placed, dry_run=True)
+
+    assert not dst.exists()                    # 何も書き込まない
+    assert (preview.removed, preview.bytes_freed) == (1, 4)
+
+    real = mf.run_migration(src, dst)
+    assert mf.remove_duplicates(real.dest_dirs, root=dst).removed == preview.removed
+
+
+def test_D6_run_migration_with_dedupe(tmp_path, unlink_fails_on):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    for name in ("a.txt", "a (1).txt", "b.txt", "b (1).txt"):
+        (src / name).write_text(name[0], encoding="utf-8")
+
+    preview = mf.run_migration(src, dst, dry_run=True, dedupe=True)
+    assert (preview.dedupe.removed, preview.ok) == (2, True)
+    assert not dst.exists()
+    assert mf.run_migration(src, tmp_path / "plain").dedupe is None   # dedupe なしなら None
+
+    unlink_fails_on("b (1).txt")
+    result = mf.run_migration(src, dst, dedupe=True)
+    assert result.dedupe.removed == 1
+    assert result.dedupe.failures == [("b (1).txt", "使用中です")]
+    assert not result.ok           # 重複の削除に失敗したら ok ではない（CLI は exit 1）
+    assert _names(dst) == ["a.txt", "b (1).txt", "b.txt"]
 
 
 # ================================================================ 進捗通知
@@ -486,9 +640,10 @@ def test_E1_progress_order(tree):
 def test_E2_progress_statuses(tree, tmp_path, fail_on):
     src, dst = tree
     (dst / "a.txt").write_text("既存", encoding="utf-8")   # a: 既存のためスキップ
+    (dst / "c.txt").write_text("c.txt", encoding="utf-8")
     ledger = mf.Ledger(tmp_path / "ledger.jsonl")
     ledger.bind(src, dst)
-    ledger.record("c.txt", "done")                          # c: 台帳で済
+    ledger.record("c.txt", "done")                          # c: 台帳で済（移行先にもある）
     fail_on("b.txt")                                        # b: 失敗
 
     got, events = _collect(src, dst, ledger=ledger)
@@ -498,7 +653,7 @@ def test_E2_progress_statuses(tree, tmp_path, fail_on):
     assert events[2].error == "読み取りエラー"
 
     got, _ = _collect(src, dst, dry_run=True, ledger=mf.Ledger(None))
-    assert [g[0] for g in got] == ["scanned", "skipped", "dryrun", "dryrun"]
+    assert [g[0] for g in got] == ["scanned", "skipped", "dryrun", "skipped"]
 
 
 def test_E3_no_events_after_cancel(tree):
@@ -509,9 +664,19 @@ def test_E3_no_events_after_cancel(tree):
     assert got == [("scanned", 0, 3, ""), ("done", 1, 3, "a.txt")]
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_E4_removed_status(tree, dry_run):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")   # 同じ内容が移行先にある
+
+    got, _ = _collect(src, dst, move=True, dry_run=dry_run)
+
+    assert [g[0] for g in got] == ["scanned", "removed", *(["dryrun"] * 2 if dry_run else ["done"] * 2)]
+
+
 # ================================================================ デモ
 
-DEMO = ROOT / "demo"
+DEMO = ROOT / "demo" / "cli"
 
 
 def _run_demo(*args: str) -> str:
@@ -529,18 +694,25 @@ def test_G1_demo_runs_all_steps(tmp_path):
     out = _run_demo("--auto", "--work", str(work))
 
     assert "Traceback" not in out
-    assert "移行先に同じ内容があるため移行元を削除 7 件" in out      # ⑧
-    assert "重複を削除: 写真/2026/旅行_01 (1).jpg" in out            # ⑨
-    assert not (work / "新PC/写真/2026/旅行_01 (1).jpg").exists()
-    assert {p.name for p in (work / "旧PC").rglob("*") if p.is_file()} == {"Thumbs.db", "~$議事録 10月.docx"}
+    assert len([line for line in out.splitlines() if line.startswith("■ P")]) == 12
+    assert "うち移行先に同じ内容があるため移行元を削除 9 件" in out   # P9 コピー済みの片付け
+    assert "重複を削除: IMG_0001 (1).jpg" in out                      # P10
+    assert "移行元が見つかりません: Downloads\\見積書_C社.pdf" in out.replace("/", "\\")  # P11
+    body = out.split("作業フォルダ:", 1)[1].split("\n", 1)[1]   # 冒頭の作業フォルダの表示より後
+    assert "D:\\写真\\旅行" in body and str(work) not in body       # 実際のパスは見せない
+    # 最後の P12 の結果: C の旅行フォルダが D へ移っている
+    assert {p.name for p in (work / "D/写真/旅行").iterdir()} == {"海_01.jpg", "海_02.jpg", "山_01.jpg"}
+    assert not any((work / "Users/user/Pictures/旅行").iterdir())
 
 
 @pytest.mark.scenario
 def test_G2_demo_only_one_step(tmp_path):
-    out = _run_demo("--only", "3", "--work", str(tmp_path / "work"))
+    out = _run_demo("--only", "7", "--work", str(tmp_path / "work"))
 
-    assert [line for line in out.splitlines() if line.startswith("■")] == ["■ ③ 同じコマンドをもう一度"]
-    assert "台帳で処理済みとしてスキップ" in out   # ② が黙って実行されている
+    assert [line for line in out.splitlines() if line.startswith("■")] == \
+        ["■ P7 途中で止まった・もう一度実行してしまった"]
+    assert out.count("PS C:\\Users\\user> python") == 1   # 準備のコピーは表示しない
+    assert "台帳で処理済みとしてスキップ 9 件" in out
 
 
 @pytest.fixture
@@ -558,18 +730,20 @@ def test_G3_make_gif_wrap_and_classify(make_gif):
     assert make_gif.width("日本") == 4
     assert make_gif.wrap("あ" * 5, cols=4) == ["ああ", "    あ", "    あ", "    あ"]
 
-    lines = make_gif.parse("\n■ ① 見出し\n  警告が出ます（説明文）\n\n\n"
-                           "  > python migrate_files.py a b\n"
+    lines = make_gif.parse("\n■ P1 見出し\n  警告が出ます（説明文）\n\n\n"
+                           "  PS C:\\Users\\user> python migrate_files.py a b\n"
                            "    [1/2] 失敗 x: エラー\n"
                            "    完了: 成功 1 / スキップ 0 / 失敗 1\n"
                            "    重複を削除: a (1).txt\n"
-                           "  📁 out/\n     └─ a.txt\n"
-                           "    （終了コード 1）\n\n")
+                           "    （終了コード 1）\n"
+                           "\n  【実行後】\n"
+                           "  📁 C:\\out\\\n     └─ a.txt\n  📁 C:\\empty\\\n     （空）\n\n")
     assert [(l.text.strip(), l.color) for l in lines] == [
-        ("", "text"), ("■ ① 見出し", "title"), ("警告が出ます（説明文）", "text"), ("", "text"),
-        ("> python migrate_files.py a b", "cmd"), ("[1/2] 失敗 x: エラー", "error"),
+        ("", "text"), ("■ P1 見出し", "title"), ("警告が出ます（説明文）", "text"), ("", "text"),
+        ("PS C:\\Users\\user> python migrate_files.py a b", "cmd"), ("[1/2] 失敗 x: エラー", "error"),
         ("完了: 成功 1 / スキップ 0 / 失敗 1", "text"), ("重複を削除: a (1).txt", "warn"),
-        ("out/", "tree"), ("└─ a.txt", "tree"), ("（終了コード 1）", "dim")]
+        ("（終了コード 1）", "dim"), ("", "text"), ("【実行後】", "label"),
+        ("C:\\out\\", "tree"), ("└─ a.txt", "tree"), ("C:\\empty\\", "tree"), ("（空）", "tree")]
 
 
 def test_G4_make_gif_render(make_gif, tmp_path):
@@ -577,7 +751,7 @@ def test_G4_make_gif_render(make_gif, tmp_path):
         fonts = make_gif.load_fonts()
     except SystemExit:
         pytest.skip("日本語フォントが無い環境")
-    lines = make_gif.parse("■ テスト\n  > python migrate_files.py a b\n    完了: 成功 1 / スキップ 0 / 失敗 0\n")
+    lines = make_gif.parse("■ テスト\n  PS C:\\> python migrate_files.py a b\n    完了: 成功 1 / スキップ 0 / 失敗 0\n")
     out = tmp_path / "t.gif"
 
     n = make_gif.render(lines, out, fonts)
