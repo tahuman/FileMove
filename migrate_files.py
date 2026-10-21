@@ -364,6 +364,7 @@ class MigrationResult:
     failures: list[tuple[str, str]] = field(default_factory=list)
     dest_dirs: list[Path] = field(default_factory=list)       # 今回の対象を置く移行先のフォルダ
     placed: dict[Path, Path] = field(default_factory=dict)    # 置いた（ドライランなら置く予定の）移行先 -> 移行元
+    dedupe: DedupeResult | None = None   # dedupe=True で実行したときの重複削除の結果
     elapsed: float = 0.0
     cancelled: bool = False
 
@@ -429,6 +430,7 @@ def run_migration(src, dst, *,
     src: 移行元のパス、またはパスのリスト（ディレクトリ・ファイル混在可）
     move: 移行元を削除する。移行先に同じ内容が既にあるもの（台帳で済・既存）は
           転送せずに移行元だけ削除する（以前にコピーしたものを後から片付けられる）
+    dedupe: 転送の後、今回ファイルを置いたフォルダの番号付き重複を削除する（result.dedupe）
     ledger: 済のものは飛ばす。ただし記録された移行先に見当たらなければ転送し直す
     progress: 1 ファイルごとに ProgressEvent が渡される（GUI の進捗表示用）
     should_cancel: True を返すと、その時点で安全に中断する
@@ -493,14 +495,12 @@ def run_migration(src, dst, *,
             # --move は移行元を消すので中身まで照合する。コピーは再開を遅くしないようサイズだけ見る
             if same_content(f, copied_to) if move else _same_size(f, copied_to):
                 if move:
-                    # 以前にコピーしたものを --move で片付ける
-                    if not drop_source(i, t):
-                        continue
+                    drop_source(i, t)   # 以前にコピーしたものを --move で片付ける
                 else:
+                    result.skipped += 1
                     result.already_done += 1
                     log.debug("[%d/%d] 済: %s", i, total, shown)
-                result.skipped += 1
-                emit(ProgressEvent("skipped", i, total, rel))
+                    emit(ProgressEvent("skipped", i, total, rel))
                 continue
             log.info("[%d/%d] 台帳では処理済みですが、移行先に見当たらないため転送し直します: %s",
                      i, total, shown)
@@ -508,9 +508,7 @@ def run_migration(src, dst, *,
         if move and same_content(f, dst / rel):
             # 移行先に同じ内容が既にある = 移動済みとみなす（同名で残したり _1 を作ったりしない）
             if drop_source(i, t):
-                result.skipped += 1
                 ledger.record(rel, "done", dest=os.path.abspath(dst / rel), reason="same_content")
-                emit(ProgressEvent("skipped", i, total, rel))
             continue
 
         dest = resolve_destination(dst / rel, on_exists, exists)
@@ -773,13 +771,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     for rel, err in result.failures:
         LOGGER.info("  - 失敗: %s: %s", rel, err)
 
-    dedupe = DedupeResult()
-    if args.dedupe and not result.cancelled:
-        # 今回の対象を置くフォルダだけを調べる（移行先にある無関係なフォルダには触らない）
-        dedupe = remove_duplicates(result.dest_dirs, root=dst, planned=result.placed,
-                                   dry_run=args.dry_run, log=LOGGER)
-        LOGGER.info("重複ファイルの削除: %d 件 / %s", dedupe.removed, human(dedupe.bytes_freed))
-        for rel, err in dedupe.failures:
+    if result.dedupe:
+        LOGGER.info("重複ファイルの削除: %d 件 / %s",
+                    result.dedupe.removed, human(result.dedupe.bytes_freed))
+        for rel, err in result.dedupe.failures:
             LOGGER.info("  - 失敗: %s: %s", rel, err)
 
     if args.dry_run:
