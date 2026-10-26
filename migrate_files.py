@@ -344,6 +344,8 @@ class ProgressEvent:
     status は "scanned"（走査完了・総数の通知）/ "done" / "skipped" /
     "removed"（--move で移行先に同じ内容があり、移行元だけ削除した。ドライランでは削除する予定）/
     "failed" / "dryrun" のいずれか。
+    dest は置いた（置く予定の）移行先、reason は skipped / removed の理由
+    （"done" 台帳で処理済み / "exists" 同名の別のファイルがある / "same" 同じ内容が既にある）。
     """
     status: str
     index: int = 0
@@ -351,6 +353,8 @@ class ProgressEvent:
     rel: str = ""
     size: int = 0
     error: str = ""
+    dest: str = ""
+    reason: str = ""
 
 
 @dataclass
@@ -365,6 +369,7 @@ class MigrationResult:
     dest_dirs: list[Path] = field(default_factory=list)       # 今回の対象を置く移行先のフォルダ
     placed: dict[Path, Path] = field(default_factory=dict)    # 置いた（ドライランなら置く予定の）移行先 -> 移行元
     dedupe: DedupeResult | None = None   # dedupe=True で実行したときの重複削除の結果
+    dirs_removed: list[Path] = field(default_factory=list)   # --move で空になって消した移行元のフォルダ
     elapsed: float = 0.0
     cancelled: bool = False
 
@@ -461,6 +466,7 @@ def run_migration(src, dst, *,
     # ドライランでも実際の実行と同じ判定になるようにする。
     placed: set[str] = set()
     exists = lambda p: p.exists() or _root_id(p) in placed  # noqa: E731
+    moved: list[_Target] = []   # 移行元から消したもの（空になったフォルダを後で消す）
 
     def drop_source(i: int, t: _Target) -> bool:
         """移行先に同じ内容がある移行元を削除する（skipped として数える）。
@@ -478,7 +484,8 @@ def run_migration(src, dst, *,
         result.sources_removed += 1
         log.info("[%d/%d] %s移行先に同じ内容があるため移行元を削除: %s",
                  i, total, "DRY-RUN " if dry_run else "", t.shown)
-        emit(ProgressEvent("removed", i, total, t.rel))
+        emit(ProgressEvent("removed", i, total, t.rel, dest=str(dst / t.rel), reason="same"))
+        moved.append(t)
         return True
 
     for i, t in enumerate(targets, 1):
@@ -500,7 +507,7 @@ def run_migration(src, dst, *,
                     result.skipped += 1
                     result.already_done += 1
                     log.debug("[%d/%d] 済: %s", i, total, shown)
-                    emit(ProgressEvent("skipped", i, total, rel))
+                    emit(ProgressEvent("skipped", i, total, rel, dest=str(copied_to), reason="done"))
                 continue
             log.info("[%d/%d] 台帳では処理済みですが、移行先に見当たらないため転送し直します: %s",
                      i, total, shown)
@@ -511,12 +518,20 @@ def run_migration(src, dst, *,
                 ledger.record(rel, "done", dest=os.path.abspath(dst / rel), reason="same_content")
             continue
 
+        if on_exists == "rename" and same_content(f, dst / rel):
+            # 両方残す指定でも、中身が同じなら _1 を作らない（同じものが 2 つになるだけ）
+            result.skipped += 1
+            log.info("[%d/%d] 移行先に同じ内容があるためスキップ: %s", i, total, shown)
+            ledger.record(rel, "done", dest=os.path.abspath(dst / rel), reason="same_content")
+            emit(ProgressEvent("skipped", i, total, rel, dest=str(dst / rel), reason="same"))
+            continue
+
         dest = resolve_destination(dst / rel, on_exists, exists)
         if dest is None:
             result.skipped += 1
             log.info("[%d/%d] 既存のためスキップ: %s", i, total, shown)
             ledger.record(rel, "skipped", reason="exists")
-            emit(ProgressEvent("skipped", i, total, rel))
+            emit(ProgressEvent("skipped", i, total, rel, dest=str(dst / rel), reason="exists"))
             continue
 
         placed.add(_root_id(dest))
@@ -524,7 +539,7 @@ def run_migration(src, dst, *,
         if dry_run:
             result.copied += 1
             log.info("[%d/%d] DRY-RUN %s -> %s", i, total, shown, dest)
-            emit(ProgressEvent("dryrun", i, total, rel))
+            emit(ProgressEvent("dryrun", i, total, rel, dest=str(dest)))
             continue
 
         try:
@@ -535,7 +550,9 @@ def run_migration(src, dst, *,
             # 別の場所から実行しても同じファイルを指すよう、絶対パスで記録する
             ledger.record(rel, "done", dest=os.path.abspath(dest), size=size, sha256=digest)
             log.info("[%d/%d] OK %s (%s)", i, total, shown, human(size))
-            emit(ProgressEvent("done", i, total, rel, size=size))
+            emit(ProgressEvent("done", i, total, rel, size=size, dest=str(dest)))
+            if move:
+                moved.append(t)
         except Exception as e:  # 1 件の失敗で全体を止めない
             result.failed += 1
             result.failures.append((shown, str(e)))
@@ -543,11 +560,40 @@ def run_migration(src, dst, *,
             log.error("[%d/%d] 失敗 %s: %s", i, total, shown, e)
             emit(ProgressEvent("failed", i, total, rel, error=str(e)))
 
+    if moved and not dry_run:
+        result.dirs_removed = remove_empty_dirs(moved, log=log)
     if dedupe and not result.cancelled:
         result.dedupe = remove_duplicates(result.dest_dirs, root=dst, planned=result.placed,
                                           dry_run=dry_run, log=log)
     result.elapsed = time.time() - started
     return result
+
+
+def remove_empty_dirs(moved: Iterable[_Target], log: logging.Logger | None = None) -> list[Path]:
+    """移動で空になった移行元のフォルダを、深いほうから消す。
+
+    消すのは移動したファイルが入っていたフォルダとその上だけで、指定された移行元
+    （例: Downloads）そのものは残す。もともと空だったフォルダや、ほかのファイルが
+    残っているフォルダは消さない。
+    """
+    log = log or LOGGER
+    candidates: dict[str, Path] = {}
+    for t in moved:
+        if not t.root.is_dir():
+            continue
+        d = t.path.parent
+        while d != t.root and t.root in d.parents:
+            candidates.setdefault(_root_id(d), d)
+            d = d.parent
+    removed: list[Path] = []
+    for d in sorted(candidates.values(), key=lambda p: len(p.parts), reverse=True):
+        try:
+            d.rmdir()   # 空でなければ OSError になり、そのまま残す
+        except OSError:
+            continue
+        removed.append(d)
+        log.info("空になったフォルダを削除: %s", d)
+    return removed
 
 
 # ================================================================ 重複ファイルの削除
@@ -594,6 +640,7 @@ class DedupeResult:
     removed: int = 0
     bytes_freed: int = 0
     failures: list[tuple[str, str]] = field(default_factory=list)
+    paths: list[Path] = field(default_factory=list)   # 削除した（ドライランなら削除する予定の）重複
 
 
 def remove_duplicates(dirs: Iterable[Path], *, root: Path | None = None,
@@ -620,6 +667,7 @@ def remove_duplicates(dirs: Iterable[Path], *, root: Path | None = None,
                 continue
         result.removed += 1
         result.bytes_freed += size
+        result.paths.append(dup)
         log.info("%s重複を削除: %s（%s と同じ内容）",
                  "DRY-RUN " if dry_run else "", shown, original.name)
     return result
@@ -705,13 +753,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="移行元（ディレクトリ／ファイル／ワイルドカード、複数可）と、最後に移行先ディレクトリ。"
                         "ディレクトリは中身を構成ごと、ファイルは移行先直下に送る")
     p.add_argument("--move", action="store_true",
-                   help="検証成功後に移行元を削除する。移行先に同じ内容が既にあるものも移行元を削除する")
+                   help="検証成功後に移行元を削除する。移行先に同じ内容が既にあるものも移行元を削除する。"
+                        "空になった移行元のフォルダも消す")
     p.add_argument("--dedupe", action="store_true",
                    help="転送後、今回ファイルを置いた移行先のフォルダで `name (1).ext` のような"
                         "番号付きファイルが番号なしのものと同じ内容なら削除する")
     p.add_argument("--dry-run", action="store_true", help="書き込まずに対象だけ表示する")
     p.add_argument("--on-exists", choices=["skip", "overwrite", "rename"], default="skip",
-                   help="移行先に同名ファイルがある場合の動作（既定: skip）")
+                   help="移行先に同名ファイルがある場合の動作（既定: skip）。"
+                        "rename でも中身が同じならスキップする")
     p.add_argument("--no-verify", action="store_true", help="SHA-256 の照合を省略する")
     p.add_argument("--ext", help="対象拡張子をカンマ区切りで 例: pdf,xlsx")
     p.add_argument("--exclude", action="append", metavar="GLOB", help="除外 glob（複数可）")
@@ -767,6 +817,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     result.already_done)
     if result.sources_removed:
         LOGGER.info("  うち移行先に同じ内容があるため移行元を削除 %d 件", result.sources_removed)
+    if result.dirs_removed:
+        LOGGER.info("空になった移行元のフォルダを削除 %d 件", len(result.dirs_removed))
     LOGGER.info("転送量 %s / 所要 %.1f秒", human(result.bytes_transferred), result.elapsed)
     for rel, err in result.failures:
         LOGGER.info("  - 失敗: %s: %s", rel, err)

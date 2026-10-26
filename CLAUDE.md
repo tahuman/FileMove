@@ -13,6 +13,8 @@
 | `demo/` | デモ。`sample.py` が共通のサンプル、`cli/` が CLI、`gui/` が GUI |
 | `docs/cli/` / `docs/gui/` | CLI / GUI のマニュアル |
 | `docs/images/cli/` / `docs/images/gui/` | CLI / GUI のデモの GIF |
+| `requirements.txt` / `requirements-dev.txt` | GUI の追加ライブラリ（無くても動く） / テスト・デモ用 |
+| `.claude/skills/gui-check/` | GUI の画面を撮って見た目を確かめる手順（skill） |
 
 ## 実装とテストは必ずセットで行う
 
@@ -42,11 +44,13 @@ python -m pytest test_gui.py        # GUI だけ
 - 処理の本体は `migrate_files.py`。GUI は本体の関数（`run_migration()`、`check_paths()`、`make_filter()` など）を呼ぶだけにする
 - GUI に処理を書かない。新しい機能はまず本体に足し、CLI と GUI の両方から使えるようにする。CLI の `main()` にしか無い処理を GUI で使いたくなったら、本体の関数に切り出す
 - GUI は今のところ Windows 向け。Windows 専用の機能（レジストリ、Windows だけのライブラリ）は使わず、後から Mac・Linux に広げられるようにしておく
+- GUI の追加ライブラリ（`requirements.txt` の sv-ttk・tkinterdnd2）は、入っていなくても動くようにする（見た目が古くなる・ドラッグ＆ドロップが使えないだけ）
+- GUI はシンプルに保つ。上から「① 移すもの → ② 移す先 → ③ 移動かコピーか → 実行」の順で、細かい設定は「詳細設定」に畳む。結果は見出しと 1 ファイルずつの一覧で、終わったか・何が残ったかがひと目で分かるようにする。結果の言葉は `gui/runner.py`（画面に依存しない）に書く
 
 ## デモ
 
 - CLI の振る舞いを変えたら `demo/cli/demo.py` のパターンを更新し、`python demo/cli/make_gif.py` で GIF（`docs/images/cli/`）を作り直す
-- GUI の画面や振る舞いを変えたら `demo/gui/demo_gui.py` のパターンを更新し、`python demo/gui/demo_gui.py` で GIF（`docs/images/gui/`）を作り直す（録画中は画面にウィンドウが出る）
+- GUI の画面や振る舞いを変えたら、skill `gui-check`（`.claude/skills/gui-check/SKILL.md`）で画面を撮って見た目を確かめる。`demo/gui/demo_gui.py` のパターンを更新し、`python demo/gui/demo_gui.py` で GIF（`docs/images/gui/`）を作り直す（録画中は画面にウィンドウが出る）
 - デモのサンプル（ダウンロード → デスクトップの整理）は `demo/sample.py` で共通にする。表示上のパスは `C:\Users\user\…` にし、実際の作業フォルダの場所は見せない
 - README には主要な使い方だけ、各 MANUAL の「シナリオで見る使い方」には全パターンを載せる
 

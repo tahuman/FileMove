@@ -70,7 +70,7 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | 11 | `--ledger $W/ledger_partial.jsonl` | 成功 22・スキップ 2（衝突 2 件）。done の記録がある report_2025.pdf・sales.csv は、移行先に見当たらないので「転送し直します」と表示してコピーする。failed/skipped 記録の sales.xlsx・photo1.jpg、別の移行・旧形式の記録しかない empty_file.txt・no_extension・archive.tar.gz もコピーされる。壊れた行でエラーにならない |
 | 11b | 11 の直後に同じコマンドを再実行 | 成功 0・スキップ 24、「うち台帳で処理済みとしてスキップ 22 件」 |
 | 12 | `--restart --ledger $W/ledger_partial.jsonl` | 台帳を無視して 1 と同じく成功 22・スキップ 2 |
-| 13 | `--move` | 成功 22・スキップ 2。src に残るのは conflict/same.txt と conflict/renamed.txt のみ |
+| 13 | `--move` | 成功 22・スキップ 2。src に残るのは conflict/same.txt と conflict/renamed.txt のみ。空になったフォルダは消え（「空になった移行元のフォルダを削除 12 件」）、残るのは conflict/・data/nested/（もともと空の empty_child/ がある）・empty_dir/ |
 | 14 | dst を `$W/src/_migrated` にする（2 回実行、2 回目は別台帳） | 1 回目 成功 24。2 回目も対象 24 件のまま（_migrated 配下を辿らない）でスキップ 24 |
 | 15 | 7 の後に src と dst の更新日時を比較 | 一致（copy2 でメタデータ保持） |
 | 16 | src と dst に同じパスを指定 | 「移行元と移行先が同じです」/ exit 2 |

@@ -9,7 +9,7 @@ GUI と本体（migrate_files）のつなぎ。画面（tkinter）には依存�
         ...
 
 処理そのものは migrate_files.run_migration() に任せ、ここでは入力の確認と、
-別スレッドで動かして結果をキューで画面に渡すことだけを行う。
+別スレッドで動かして結果をキューで画面に渡すこと、結果を画面の言葉にすることだけを行う。
 """
 
 from __future__ import annotations
@@ -20,13 +20,14 @@ import queue
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import migrate_files as mf
 
-# 画面の選択肢 -> --on-exists の値
+# 画面の選択肢 -> --on-exists の値（先頭が画面の既定。中身が同じものは両方残さずスキップする）
 ON_EXISTS = {
-    "スキップする（上書きしない）": "skip",
     "番号を付けて両方残す": "rename",
+    "移さずに残す": "skip",
     "上書きする": "overwrite",
 }
 
@@ -50,21 +51,40 @@ class Form:
     verify: bool = True
 
 
+def _screen_words(text: str) -> str:
+    """本体の文言（CLI の言葉）を画面の項目名に直す。"""
+    for cli, screen in (("--since ", "期間"), ("移行元", "移すもの"), ("移行先", "移す先")):
+        text = text.replace(cli, screen)
+    return text
+
+
+def clean_path(text: str) -> str:
+    """貼り付けたパスの前後の空白と "（エクスプローラーの「パスのコピー」で付く）を取る。"""
+    text = text.strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1].strip()
+    return text
+
+
 def build_options(form: Form) -> dict:
     """入力を確かめて run_migration() に渡す引数にする。問題があれば ValueError（画面にそのまま出す文言）。"""
     if not form.sources:
-        raise ValueError("移行元を追加してください")
+        raise ValueError("移すものを追加してください")
     missing = [str(p) for p in form.sources if not p.exists()]
     if missing:
-        raise ValueError("移行元が見つかりません: " + ", ".join(missing))
-    if not form.dest.strip():
-        raise ValueError("移行先のフォルダを選んでください")
-    dst = Path(form.dest.strip())
-    mf.check_paths(form.sources, dst)
+        raise ValueError("移すものが見つかりません: " + ", ".join(missing))
+    dest = clean_path(form.dest)
+    if not dest:
+        raise ValueError("移す先のフォルダを選んでください")
+    dst = Path(dest)
+    if not dst.is_absolute():   # 相対パスだと、GUI を起動したフォルダの中に作られてしまう
+        raise ValueError("移す先は、ドライブからの場所で入れてください（例: C:\\Users\\…\\Desktop）。"
+                         "「参照…」で選ぶと確実です")
     try:
+        mf.check_paths(form.sources, dst)
         filt = mf.make_filter(ext=form.exts, since=form.since)
-    except ValueError as e:   # 本体の文言は CLI のオプション名なので、画面の項目名に直す
-        raise ValueError(str(e).replace("--since ", "期間")) from None
+    except ValueError as e:
+        raise ValueError(_screen_words(str(e))) from None
     return dict(src=list(form.sources), dst=dst, filt=filt, move=form.move,
                 on_exists=form.on_exists, dedupe=form.dedupe, verify=form.verify)
 
@@ -129,6 +149,7 @@ class MigrationJob:
             result = mf.run_migration(**self.options, dry_run=self.dry_run, ledger=ledger, log=log,
                                       progress=lambda ev: self.events.put(("progress", ev)),
                                       should_cancel=self._cancel.is_set)
+            log.info("%s", summary(result, self.dry_run))
             self.events.put(("finished", result))
         except Exception as e:  # 想定外のエラーも画面に出して、ボタンを戻せるようにする
             self.events.put(("error", str(e)))
@@ -137,8 +158,103 @@ class MigrationJob:
             log.removeHandler(handler)
 
 
+# ---------------------------------------------------------------- 結果の見せ方（画面に依存しない）
+
+@dataclass
+class Row:
+    """結果の一覧の 1 行。tag は色分け（ok / plan / muted / warn / error）。"""
+    state: str
+    name: str
+    note: str
+    tag: str
+
+
+def describe(ev: mf.ProgressEvent, *, move: bool, dry_run: bool,
+             display: Callable[[str], str] = lambda s: s) -> Row | None:
+    """進捗の通知を、結果の一覧の 1 行にする（scanned は行にしない）。"""
+    verb = "移動" if move else "コピー"
+    dest = display(ev.dest)
+    if ev.status == "done":
+        return Row(f"✔ {verb}しました", ev.rel, dest, "ok")
+    if ev.status == "dryrun":
+        return Row(f"→ {verb}します", ev.rel, dest, "plan")
+    if ev.status == "removed":
+        return Row("→ 元を削除します" if dry_run else "✔ 移動しました", ev.rel,
+                   f"{dest}（同じものが既にあるので、元だけ削除）", "plan" if dry_run else "ok")
+    if ev.status == "skipped" and ev.reason == "exists":
+        return Row("⚠ 残します" if dry_run else "⚠ 残しました", ev.rel,
+                   "移す先に同じ名前の別のファイルがあります", "warn")
+    if ev.status == "skipped":
+        why = "前回までに済んでいます" if ev.reason == "done" else "同じものが移す先に既にあります"
+        return Row("✔ 済み", ev.rel, f"{dest}（{why}）", "muted")
+    if ev.status == "failed":
+        return Row("✗ できませんでした", ev.rel, ev.error, "error")
+    return None
+
+
+def dedupe_rows(result: mf.MigrationResult, *, dry_run: bool, root: Path,
+                display: Callable[[str], str] = lambda s: s) -> list[Row]:
+    """重複の削除の結果を、一覧の行にする。"""
+    if not result.dedupe:
+        return []
+    rows = [Row("→ 重複を削除します" if dry_run else "✔ 重複を削除しました", _rel(p, root),
+                display(str(p)), "plan" if dry_run else "ok") for p in result.dedupe.paths]
+    rows += [Row("✗ できませんでした", name, err, "error") for name, err in result.dedupe.failures]
+    return rows
+
+
+def _rel(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+@dataclass
+class Outcome:
+    """終わったときに結果の欄に大きく出す内容。level は ok / info / warn / error。"""
+    level: str
+    title: str
+    detail: str
+
+
+def outcome(result: mf.MigrationResult, *, dry_run: bool, move: bool, kept: int = 0) -> Outcome:
+    """結果を、ひと目で分かる見出しと説明にする。kept は同じ名前のため残したファイルの数。"""
+    verb = "移動" if move else "コピー"
+    done = result.copied + result.sources_removed
+    extra = []
+    if result.dedupe and result.dedupe.removed:
+        extra.append(f"重複を{'削除する予定' if dry_run else '削除'} {result.dedupe.removed} 件")
+    if result.dirs_removed:
+        extra.append(f"空になったフォルダを削除 {len(result.dirs_removed)} 件")
+    if result.already_done:
+        extra.append(f"前回までに済み {result.already_done} 件")
+    tail = "（" + "、".join(extra) + "）" if extra else ""
+
+    if result.cancelled:
+        return Outcome("warn", "中止しました",
+                       f"{done} 件を{verb}したところで止めました。もう一度押すと続きから行います。")
+    if dry_run:
+        kept_note = f"{kept} 件は、移す先に同じ名前の別のファイルがあるため残します。" if kept else ""
+        return Outcome("info", "確認だけしました（まだ何も変えていません）",
+                       f"{done} 件を{verb}します{tail}。{kept_note}よければ「{verb}する」を押してください。")
+    failed = result.failed + (len(result.dedupe.failures) if result.dedupe else 0)
+    if failed:
+        return Outcome("error", f"{failed} 件ができませんでした",
+                       f"{done} 件は{verb}しました{tail}。赤い行を見てください。"
+                       "もう一度押すと、できなかったものだけやり直します。")
+    if kept:
+        return Outcome("warn", f"{done} 件を{verb}しました。{kept} 件は残しています",
+                       f"移す先に同じ名前の別のファイルがあるためです{tail}。両方残すには、"
+                       "詳細設定の「同じ名前があるとき」を「番号を付けて両方残す」にしてください。")
+    if not done and not result.skipped:
+        return Outcome("info", f"{verb}するファイルがありませんでした",
+                       "移すものが空か、詳細設定の種類・期間の条件に合うものがありません。")
+    return Outcome("ok", f"完了しました: {done} 件を{verb}しました", "、".join(extra))
+
+
 def summary(result: mf.MigrationResult, dry_run: bool) -> str:
-    """完了したときに画面に出す 1〜2 行。"""
+    """件数の 1 行（ログの最後に出す）。"""
     head = "中止しました" if result.cancelled else "確認しました（ドライラン）" if dry_run else "完了しました"
     text = f"{head}: 成功 {result.copied} / スキップ {result.skipped} / 失敗 {result.failed}"
     extra = []
@@ -146,8 +262,10 @@ def summary(result: mf.MigrationResult, dry_run: bool) -> str:
         extra.append(f"元だけ削除 {result.sources_removed}")
     if result.dedupe and result.dedupe.removed:
         extra.append(f"重複を削除 {result.dedupe.removed}")
+    if result.dirs_removed:
+        extra.append(f"空のフォルダを削除 {len(result.dirs_removed)}")
     if extra:
         text += "（" + "、".join(extra) + "）"
     if dry_run:
-        text += "\n※ ドライランのため、まだ何も書き込んでいません。よければ「実行」を押してください。"
+        text += "\n※ ドライランのため、まだ何も書き込んでいません。"
     return text
