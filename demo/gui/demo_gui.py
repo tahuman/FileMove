@@ -7,9 +7,10 @@ FileMove の GUI のデモ。CLI のデモと同じ「ダウンロード → デ
     python demo/gui/demo_gui.py            # 全パターンを録画 -> docs/images/gui/demo_g*.gif
     python demo/gui/demo_gui.py 2 4        # 指定したパターンだけ（G2 と G4）
     python demo/gui/demo_gui.py --show 2   # 録画せず、画面で動きだけ見る
+    python demo/gui/demo_gui.py --snap OUT 2   # 待たずに動かし、変わった画面を OUT に PNG で保存（見た目の確認用）
 
 録画中は画面に FileMove のウィンドウが開き、ほかのウィンドウより手前に出る（画面を撮影するため）。
-ファイル選択の画面は自動で操作できないので、「フォルダを追加…」などはボタンを指したうえで、
+ファイル選択の画面やドラッグ＆ドロップは自動で操作できないので、ボタンや一覧を指したうえで、
 選んだ結果を直接入れている。表示上のパスは C:\\Users\\user\\… / D:\\…（demo/sample.py）。
 Windows 用（画面の撮影に Pillow の ImageGrab を使う）。
 """
@@ -31,7 +32,7 @@ sys.path.insert(0, str(ROOT))          # migrate_files と gui
 sys.path.insert(0, str(HERE.parent))   # demo/sample.py
 
 import migrate_files as mf  # noqa: E402
-from gui.app import App, setup_fonts  # noqa: E402
+from gui.app import App, apply_theme, make_root  # noqa: E402
 from sample import D_SHOWN, HOME_SHOWN, Sample  # noqa: E402
 
 OUT_DIR = ROOT / "docs" / "images" / "gui"
@@ -86,9 +87,9 @@ class Recorder:
                 w.winfo_rooty() - self.root.winfo_rooty() + w.winfo_height() // 2)
 
     def wait(self, ms: int) -> None:
-        """ms のあいだ画面を動かしながら撮る（realtime でなければ待たずに画面を 1 回動かすだけ）。"""
+        """ms のあいだ画面を動かしながら撮る（realtime でなければ待たずに 1 回だけ撮る）。"""
         if not self.realtime:
-            self.root.update()
+            self.shot()
             time.sleep(0.005)
             return
         end = time.time() + ms / 1000
@@ -96,6 +97,13 @@ class Recorder:
             t = time.time()
             self.shot()
             time.sleep(max(0.0, FRAME_MS / 1000 - (time.time() - t)))
+
+    def save_png(self, out_dir: Path, prefix: str) -> int:
+        """撮った画面を 1 枚ずつ PNG で保存する（--snap）。"""
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for n, img in enumerate(self.frames, 1):
+            img.save(out_dir / f"{prefix}_{n:02}.png")
+        return len(self.frames)
 
     def save(self, out: Path) -> int:
         from PIL import Image
@@ -122,7 +130,7 @@ def compose(window, title: str, caption: str, pointer: tuple[int, int] | None):
     from PIL import Image, ImageDraw
     bar_h, cap_h = 34, 64
     w, h = window.size
-    img = Image.new("RGB", (w, bar_h + h + cap_h), (243, 243, 243))
+    img = Image.new("RGB", (w, bar_h + h + cap_h), (250, 250, 250))
     img.paste(window, (0, bar_h))
     d = ImageDraw.Draw(img)
 
@@ -174,12 +182,17 @@ class Driver:
         action()
         self.rec.wait(500)
 
-    def add_source(self, shown: str) -> None:
-        self.click(self.app.add_folder_btn, f"「フォルダを追加…」で {shown} を選ぶ",
-                   lambda: self.app.add_source(self.sample.real(shown)))
+    def add_source(self, shown: str, drag: bool = False) -> None:
+        real = self.sample.real(shown)
+        if drag:
+            self.click(self.app.src_list, f"エクスプローラーから {shown} を ① にドラッグ＆ドロップ",
+                       lambda: self.app.drop_sources("{" + str(real) + "}"))
+        else:
+            self.click(self.app.add_folder_btn, f"「フォルダを追加…」で {shown} を選ぶ",
+                       lambda: self.app.add_source(real))
 
     def set_dest(self, shown: str) -> None:
-        self.click(self.app.dest_btn, f"「参照…」で移行先に {shown} を選ぶ",
+        self.click(self.app.dest_btn, f"「参照…」で ② 移す先に {shown} を選ぶ",
                    lambda: self.app.set_dest(self.sample.real(shown)))
 
     def type_into(self, entry: tk.Widget, var: tk.StringVar, text: str, caption: str) -> None:
@@ -191,15 +204,24 @@ class Driver:
         self.rec.wait(400)
 
     def choose_move(self) -> None:
-        self.click(self.app.move_radio, "方法で「移動（元のファイルを消す）」を選ぶ", lambda: self.app.move_var.set(True))
+        self.click(self.app.move_radio, "③ は「移動」のまま（元のファイルは消える）", lambda: self.app.move_var.set(True))
+
+    def choose_copy(self) -> None:
+        self.click(self.app.copy_radio, "③ で「コピー」を選ぶ（元のファイルも残す）", lambda: self.app.move_var.set(False))
+
+    def open_more(self) -> None:
+        def action() -> None:
+            self.app.more_var.set(True)
+            self.app._toggle_more()
+        self.click(self.app.more_check, "「詳細設定」を開く", action)
 
     def run(self, dry_run: bool) -> None:
         btn = self.app.preview_btn if dry_run else self.app.run_btn
-        name = "確認（ドライラン）" if dry_run else "実行"
+        name = btn.cget("text")
         self.click(btn, f"「{name}」を押す" + ("" if dry_run or not self.app.move_var.get()
-                                                else "（確認の画面で「はい」）"),
+                                               else "（確認の画面で「はい」）"),
                    lambda: self.app.start(dry_run=dry_run))
-        self.rec.caption = "実行中…（進捗バーと件数が進む）" if not dry_run else "確認中…"
+        self.rec.caption = "確認中…" if dry_run else "実行中…（進捗バーが進み、一覧に 1 件ずつ結果が出る）"
         self.rec.pointer = None
         while self.app.job and (self.app.job.running or not self.app.job.events.empty()):
             self.rec.wait(FRAME_MS)
@@ -213,25 +235,27 @@ def g1(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\整理")
     d.run(dry_run=True)
-    d.say("ログに、どのファイルがどこへ行くかが出る。まだ何も書き込んでいない", 2500)
+    d.say("一覧に、どのファイルがどこへ行くかが出る。まだ何も変えていない", 2500)
 
 
 @pattern("G2 ダウンロードのファイルを、デスクトップへ移したい", gif="g02_move")
 def g2(d: Driver) -> None:
-    d.add_source(f"{HOME_SHOWN}\\Downloads")
+    d.add_source(f"{HOME_SHOWN}\\Downloads", drag=True)
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\整理")
     d.choose_move()
     d.run(dry_run=False)
-    d.say("移行先で中身が同じと確かめてから、ダウンロードのファイルを消した", 2500)
+    d.say("完了。中身を確かめてから元を消し、空になったフォルダも片付けた", 2500)
+    d.point(d.app.open_btn, "「移す先を開く」で、移した先のフォルダを開ける", 1500)
 
 
 @pattern("G3 書類と写真を、別々のフォルダに振り分けたい", gif="g03_sort")
 def g3(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\書類")
-    d.choose_move()
+    d.open_more()
     d.type_into(d.app.exts_entry, d.app.exts_var, "pdf,docx,xlsx,txt", "種類（拡張子）に書類の拡張子を入れる")
     d.run(dry_run=False)
+    d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\写真")
     d.type_into(d.app.exts_entry, d.app.exts_var, "jpg", "種類（拡張子）を jpg に変える")
     d.run(dry_run=False)
@@ -242,7 +266,7 @@ def g3(d: Driver) -> None:
 def g4(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\写真")
-    d.choose_move()
+    d.open_more()
     d.type_into(d.app.exts_entry, d.app.exts_var, "jpg", "種類（拡張子）に jpg を入れる")
     d.click(d.app.dedupe_check, "「(1) 付きの重複ファイルを消す」にチェックを入れる",
             lambda: d.app.dedupe_var.set(True))
@@ -250,18 +274,16 @@ def g4(d: Driver) -> None:
     d.say("IMG_0001 (1).jpg は IMG_0001.jpg と中身が同じなので消えた", 2500)
 
 
-@pattern("G5 移行先に同じ名前のファイルがある", gif="g05_same-name",
+@pattern("G5 移す先に同じ名前のファイルがある", gif="g05_same-name",
          extra=[("Desktop/整理/メモ.txt", "前に書いたメモ\n", 30)])
 def g5(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\整理")
-    d.type_into(d.app.exts_entry, d.app.exts_var, "txt", "種類（拡張子）に txt を入れる（デスクトップにも メモ.txt がある）")
+    d.choose_copy()
+    d.open_more()
+    d.type_into(d.app.exts_entry, d.app.exts_var, "txt", "種類に txt を入れる（デスクトップにも別の メモ.txt がある）")
     d.run(dry_run=False)
-    d.say("既定では上書きせずにスキップする", 1500)
-    d.click(d.app.on_exists_combo, "「同じ名前があるとき」を「番号を付けて両方残す」に変える",
-            lambda: d.app.on_exists_var.set("番号を付けて両方残す"))
-    d.run(dry_run=False)
-    d.say("メモ_1.txt として両方残った", 2500)
+    d.say("上書きせず、メモ_1.txt として両方残る（中身が同じなら作らない）", 2500)
 
 
 @pattern("G6 C ドライブが一杯なので、写真を D ドライブへ移したい", gif="g06_drive")
@@ -285,9 +307,10 @@ def _dpi_aware() -> None:
 
 
 def play(index: int, work: Path, *, record: bool, out_dir: Path = OUT_DIR, slow: bool = True,
-         hidden: bool = False) -> Path | None:
+         hidden: bool = False, snap: Path | None = None) -> Path | None:
     """index 番目（1 から）のパターンを実行する。record なら GIF を保存してそのパスを返す。
-    slow は進捗が見えるよう転送をゆっくりにする。hidden はウィンドウを出さない（テスト用）。"""
+    slow は進捗が見えるよう転送をゆっくりにする。hidden はウィンドウを出さない（テスト用）。
+    snap を渡すと、待たずに動かして、変わった画面をそのフォルダに PNG で保存する。"""
     title, fn, gif, extra = PATTERNS[index - 1]
     sample = Sample(work)
     sample.build(extra)
@@ -299,21 +322,25 @@ def play(index: int, work: Path, *, record: bool, out_dir: Path = OUT_DIR, slow:
             return real_transfer(*a, **kw)
         mf.transfer_file = transfer
 
-    root = tk.Tk()
+    root = make_root()
     if hidden:
         root.withdraw()
     try:
-        setup_fonts(root)
+        apply_theme(root)
         app = App(root, ledger_path=sample.work / "ledger.jsonl", display=sample.shown,
                   parse=lambda s: str(sample.real(s)) if s.startswith((HOME_SHOWN, D_SHOWN)) else s,
-                  confirm=lambda *a: True)
-        root.geometry("780x760+40+40")
-        if record:
+                  confirm=lambda *a: True, opener=lambda p: None)
+        root.geometry("820x860+40+40")
+        if record or snap:
             root.attributes("-topmost", True)   # 撮影するので手前に出す
-        rec = Recorder(root, title, enabled=record, realtime=not hidden)
+        rec = Recorder(root, title, enabled=record or snap is not None, realtime=not (hidden or snap))
         driver = Driver(app, rec, sample)
         driver.say("ダウンロード → デスクトップの整理（FileMove の画面）", 800)
         fn(driver)
+        if snap:
+            n = rec.save_png(snap, f"g{index}")
+            print(f"{snap / f'g{index}_*.png'}  {n} 枚")
+            return None
         if record:
             out = out_dir / f"demo_{gif}.gif"
             n = rec.save(out)
@@ -331,6 +358,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("patterns", nargs="*", type=int, help=f"パターンの番号 1〜{len(PATTERNS)}（省略時は全部）")
     ap.add_argument("--show", action="store_true", help="録画せず、画面で動きだけ見る")
     ap.add_argument("--out", type=Path, default=OUT_DIR, help="GIF の出力先フォルダ")
+    ap.add_argument("--snap", type=Path, metavar="DIR", help="GIF を作らず、変わった画面を DIR に PNG で保存する")
     args = ap.parse_args(argv)
     if any(not 1 <= i <= len(PATTERNS) for i in args.patterns):
         ap.error(f"パターンの番号は 1〜{len(PATTERNS)} で指定してください")
@@ -338,7 +366,8 @@ def main(argv: list[str] | None = None) -> int:
     _dpi_aware()
     with tempfile.TemporaryDirectory() as tmp:
         for i in args.patterns or range(1, len(PATTERNS) + 1):
-            play(i, Path(tmp) / "work", record=not args.show, out_dir=args.out)
+            play(i, Path(tmp) / "work", record=not (args.show or args.snap), out_dir=args.out,
+                 slow=not args.snap, snap=args.snap)
     return 0
 
 

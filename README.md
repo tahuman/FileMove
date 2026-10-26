@@ -19,11 +19,11 @@
 
 ダウンロードにたまったファイルを、デスクトップへ移して整理する例です。
 
-**① 何が起きるか、先に確認する**（「確認（ドライラン）」。何も書き込まずに、どこへ行くかだけをログに表示）
+**① 何が起きるか、先に確認する**（「先に確認する」。何も変えずに、どこへ行くかだけを一覧に表示）
 
 ![GUI 確認](docs/images/gui/demo_g01_dry-run.gif)
 
-**② 移動する**（方法で「移動」を選んで「実行」。移行先で中身の一致を確かめてから元を消す）
+**② 移動する**（ドラッグ＆ドロップで選んで「移動する」。移す先で中身の一致を確かめてから元を消し、終わると結果が大きく出る）
 
 ![GUI 移動](docs/images/gui/demo_g02_move.gif)
 
@@ -52,10 +52,12 @@ python migrate_files.py 移行元 [移行元 ...] 移行先             # 実行
 
 | やりたいこと | コマンド |
 |---|---|
+| GUI の見た目・ドラッグ＆ドロップを使う | `python -m pip install -r requirements.txt`（sv-ttk・tkinterdnd2。無くても動く） |
 | テスト（本体・CLI・GUI・シナリオ） | `python -m pip install -r requirements-dev.txt` の後に `python -m pytest` |
 | CLI のデモを動かす | `python demo/cli/demo.py`（`--auto` で止まらずに流す、`--only 3` で P3 だけ） |
 | CLI のデモの GIF を作り直す | `python demo/cli/make_gif.py`（`docs/images/cli/` に出力。Pillow が必要） |
 | GUI のデモを見る | `python demo/gui/demo_gui.py --show 2`（G2 を画面で再生） |
 | GUI のデモの GIF を作り直す | `python demo/gui/demo_gui.py`（`docs/images/gui/` に出力。Windows・Pillow が必要。録画中は画面にウィンドウが出る） |
+| GUI の画面を撮って確かめる | `python demo/gui/demo_gui.py --snap 出力先 2`（変わった画面を PNG で保存） |
 
 構成: 本体と CLI は `migrate_files.py`、GUI は `gui/`（本体の `run_migration()` を呼ぶだけ）。今後の予定は [plan.md](plan.md)。

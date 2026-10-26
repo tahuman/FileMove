@@ -38,11 +38,15 @@ migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテスト�
            片付けたものは「台帳で処理済み」には数えない
     - [V4] ドライランでは移行元を消さずに件数だけ数える
     - [V5] 移行元の削除に失敗したら failed になり、残りは続けて処理される
+    - [V6] --move で空になった移行元のフォルダを深いほうから消す。指定した移行元そのもの・
+           ファイルが残るフォルダ・もともと空のフォルダは残す。ドライランでは消さない
+    - [V7] rename でも、移行先に同じ内容があれば _1 を作らずスキップする（reason は same）
   重複ファイルの削除（--dedupe）
     - [D1] find_duplicates: `name (n).ext` で同じフォルダの `name.ext` と同じ内容のものだけを返す
            （中身が違う・元が無い・番号なしのものは対象外。全角括弧・多重拡張子も扱う。
            渡したフォルダだけを見て、サブフォルダはたどらない）
-    - [D2] remove_duplicates: 重複だけを消し、ドライランでは消さない。`(1) (1)` の連鎖でも元は残る
+    - [D2] remove_duplicates: 重複だけを消し、ドライランでは消さない。`(1) (1)` の連鎖でも元は残る。
+           消した（消す予定の）ものは paths に入る
     - [D3] 削除に失敗したものは failures に入り、残りは続けて処理される
     - [D4] 対象は今回の移行でファイルを置くフォルダだけ。移行先の無関係なフォルダには触らない
     - [D5] ドライランでも、これから置く予定のファイルを含めて判定し、実行したときと結果が一致する
@@ -54,6 +58,8 @@ migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテスト�
            failed には error が入る
     - [E3] 中止したら、それ以降の通知は届かない
     - [E4] --move で移行先に同じ内容があり移行元だけ消したものは removed で届く（ドライランでも）
+    - [E5] done / dryrun / skipped / removed には移行先（dest）が入り、skipped / removed には
+           理由（reason: done / exists / same）が入る（GUI の結果の一覧が依存する）
   CLI のデモ（demo/cli/demo.py と、その GIF を作る demo/cli/make_gif.py）
     - [G1] デモの全 12 パターンが指定した作業フォルダで最後まで動き、片付け・重複削除・指定ミス・
            ドライブ間の移動が期待どおりになる。表示には実際の作業フォルダのパスを出さない
@@ -490,6 +496,37 @@ def test_V5_drop_source_failure(tree, unlink_fails_on):
     assert ledger.get("a.txt") == {}   # done にしないので次回また片付けを試みる
 
 
+def test_V6_move_removes_emptied_dirs(tmp_path):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    for rel in ("資料/2025/a.txt", "資料/b.txt", "写真/c.jpg", "残す/d.txt"):
+        (src / rel).parent.mkdir(parents=True, exist_ok=True)
+        (src / rel).write_text(rel, encoding="utf-8")
+    (src / "空").mkdir()                                     # もともと空
+    filt = mf.make_filter(ext="txt,jpg")
+    (src / "残す" / "e.log").write_text("対象外", encoding="utf-8")   # 拡張子で対象外 -> 残る
+
+    preview = mf.run_migration(src, dst, move=True, dry_run=True, filt=filt)
+    assert preview.dirs_removed == [] and (src / "資料" / "2025").is_dir()
+
+    result = mf.run_migration(src, dst, move=True, filt=filt)
+
+    assert {p.relative_to(src).as_posix() for p in result.dirs_removed} == {"資料/2025", "資料", "写真"}
+    assert sorted(p.relative_to(src).as_posix() for p in src.rglob("*")) == ["残す", "残す/e.log", "空"]
+    assert src.is_dir()                                       # 指定した移行元そのものは残す
+
+
+def test_V7_rename_skips_same_content(tree):
+    src, dst = tree
+    (dst / "a.txt").write_text("a.txt", encoding="utf-8")   # 同じ内容
+    (dst / "b.txt").write_text("違う", encoding="utf-8")    # 中身が違う
+
+    got, events = _collect(src, dst, on_exists="rename")
+
+    assert [(e.status, e.rel, e.reason) for e in events[1:]] == [
+        ("skipped", "a.txt", "same"), ("done", "b.txt", ""), ("done", "c.txt", "")]
+    assert _names(dst) == ["a.txt", "b.txt", "b_1.txt", "c.txt"]
+
+
 # ================================================================ 重複ファイルの削除
 
 @pytest.fixture
@@ -552,6 +589,7 @@ def test_D2_remove_duplicates(dups):
     assert result.removed == len(DUPLICATES)
     assert result.bytes_freed == sum(len(n) for n in ("same", "same", "gz", "jpg", "chain", "chain"))
     assert _rels(dups) == before - DUPLICATES
+    assert {p.relative_to(dups).as_posix() for p in result.paths} == DUPLICATES
     assert (dups / "a.txt").exists()
 
 
@@ -672,6 +710,29 @@ def test_E4_removed_status(tree, dry_run):
     got, _ = _collect(src, dst, move=True, dry_run=dry_run)
 
     assert [g[0] for g in got] == ["scanned", "removed", *(["dryrun"] * 2 if dry_run else ["done"] * 2)]
+
+
+def test_E5_progress_dest_and_reason(tree, tmp_path):
+    src, dst = tree
+    (dst / "a.txt").write_text("既存", encoding="utf-8")   # a: 同名の別のファイル
+    (dst / "b.txt").write_text("b.txt", encoding="utf-8")  # b: 同じ内容
+    ledger = mf.Ledger(tmp_path / "ledger.jsonl")
+
+    _, events = _collect(src, dst, move=True, ledger=ledger)
+    assert [(e.status, e.dest, e.reason) for e in events[1:]] == [
+        ("skipped", str(dst / "a.txt"), "exists"),
+        ("removed", str(dst / "b.txt"), "same"),
+        ("done", str(dst / "c.txt"), "")]
+
+    (src / "c.txt").write_text("c.txt", encoding="utf-8")   # 台帳で済のものをもう一度コピー
+    _, events = _collect(src, dst, ledger=ledger)
+    ledger.close()
+    assert (events[-1].status, events[-1].reason) == ("skipped", "done")
+    assert events[-1].dest == os.path.abspath(dst / "c.txt")
+
+    _, events = _collect(src, tmp_path / "new", dry_run=True)
+    assert [(e.status, e.dest) for e in events[1:]] == [("dryrun", str(tmp_path / "new" / "a.txt")),
+                                                         ("dryrun", str(tmp_path / "new" / "c.txt"))]
 
 
 # ================================================================ デモ

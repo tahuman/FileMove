@@ -49,6 +49,10 @@ def files(base: Path) -> set[str]:
     return {p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_file()}
 
 
+def dirs(base: Path) -> set[str]:
+    return {p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_dir()}
+
+
 def expect(cond: bool, msg: str) -> None:
     if not cond:
         raise AssertionError(msg)
@@ -93,8 +97,11 @@ SCENARIOS: list[Scenario] = [
     Scenario("12", "--restart", [S(), DST, "--restart", "--log", W / "m.log",
                                  "--ledger", W / "ledger_partial.jsonl"], std_ledger=False, counts=(22, 2, 0)),
     Scenario("13", "--move", [S(), DST, "--move"], counts=(22, 2, 0),
-             check=lambda o: expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
-                                    f"src の残り: {files(SRC)}")),
+             check=lambda o: (expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
+                                     f"src の残り: {files(SRC)}"),
+                              expect(dirs(SRC) == {"conflict", "data", "data/nested", "data/nested/empty_child",
+                                                   "empty_dir"}, f"src のフォルダの残り: {dirs(SRC)}"),
+                              expect("空になった移行元のフォルダを削除 12 件" in o, "空フォルダの削除の件数"))),
     Scenario("14", "移行先が移行元の配下", [S(), S("_migrated")], counts=(24, 0, 0)),
     Scenario("14b", "同（別台帳で再実行）", [S(), S("_migrated"), "--log", W / "m.log",
                                        "--ledger", W / "l2.jsonl"], std_ledger=False, reset=False,
