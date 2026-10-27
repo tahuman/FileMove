@@ -185,14 +185,14 @@ class Driver:
     def add_source(self, shown: str, drag: bool = False) -> None:
         real = self.sample.real(shown)
         if drag:
-            self.click(self.app.src_list, f"エクスプローラーから {shown} を ① にドラッグ＆ドロップ",
+            self.click(self.app.src_list, f"エクスプローラーから {shown} を ① 対象フォルダにドラッグ＆ドロップ",
                        lambda: self.app.drop_sources("{" + str(real) + "}"))
         else:
-            self.click(self.app.add_folder_btn, f"「フォルダを追加…」で {shown} を選ぶ",
+            self.click(self.app.add_folder_btn, f"「フォルダを追加…」で ① 対象フォルダに {shown} を選ぶ",
                        lambda: self.app.add_source(real))
 
     def set_dest(self, shown: str) -> None:
-        self.click(self.app.dest_btn, f"「参照…」で ② 移す先に {shown} を選ぶ",
+        self.click(self.app.dest_btn, f"「参照…」で ② 保存先フォルダに {shown} を選ぶ",
                    lambda: self.app.set_dest(self.sample.real(shown)))
 
     def type_into(self, entry: tk.Widget, var: tk.StringVar, text: str, caption: str) -> None:
@@ -209,19 +209,23 @@ class Driver:
     def choose_copy(self) -> None:
         self.click(self.app.copy_radio, "③ で「コピー」を選ぶ（元のファイルも残す）", lambda: self.app.move_var.set(False))
 
-    def open_more(self) -> None:
-        def action() -> None:
-            self.app.more_var.set(True)
-            self.app._toggle_more()
-        self.click(self.app.more_check, "「詳細設定」を開く", action)
+    def preview(self, note: str = "一覧で、どのファイルがどこへ行くかを確かめる（まだ何も変えていない）") -> None:
+        self.click(self.app.preview_btn, "「確認」を押す", lambda: self.app.start(dry_run=True))
+        self._wait_job("確認中…")
+        self.say(note, 1800)
 
-    def run(self, dry_run: bool) -> None:
-        btn = self.app.preview_btn if dry_run else self.app.run_btn
-        name = btn.cget("text")
-        self.click(btn, f"「{name}」を押す" + ("" if dry_run or not self.app.move_var.get()
-                                               else "（確認の画面で「はい」）"),
-                   lambda: self.app.start(dry_run=dry_run))
-        self.rec.caption = "確認中…" if dry_run else "実行中…（進捗バーが進み、一覧に 1 件ずつ結果が出る）"
+    def execute(self) -> None:
+        self.click(self.app.run_btn, "「実行」を押す" + ("（確認の画面で「はい」）" if self.app.move_var.get() else ""),
+                   lambda: self.app.start(dry_run=False))
+        self._wait_job("実行中…（太い進捗バーが進む）")
+
+    def run(self) -> None:
+        """確認 → 実行（実行は確認の後でないと押せない）。"""
+        self.preview()
+        self.execute()
+
+    def _wait_job(self, caption: str) -> None:
+        self.rec.caption = caption
         self.rec.pointer = None
         while self.app.job and (self.app.job.running or not self.app.job.events.empty()):
             self.rec.wait(FRAME_MS)
@@ -234,8 +238,9 @@ class Driver:
 def g1(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\整理")
-    d.run(dry_run=True)
-    d.say("一覧に、どのファイルがどこへ行くかが出る。まだ何も変えていない", 2500)
+    d.point(d.app.run_btn, "「確認」を押すまで、「実行」は押せない", 1200)
+    d.preview("一覧に、どのファイルがどこへ行くかが出る。まだ何も変えていない")
+    d.point(d.app.run_btn, "内容を確かめたら「実行」を押せるようになる", 1800)
 
 
 @pattern("G2 ダウンロードのファイルを、デスクトップへ移したい", gif="g02_move")
@@ -243,22 +248,21 @@ def g2(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads", drag=True)
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\整理")
     d.choose_move()
-    d.run(dry_run=False)
-    d.say("完了。中身を確かめてから元を消し、空になったフォルダも片付けた", 2500)
-    d.point(d.app.open_btn, "「移す先を開く」で、移した先のフォルダを開ける", 1500)
+    d.run()
+    d.say("完了。一覧とログは閉じて保存した。(1) 付きの重複も消えている", 2500)
+    d.point(d.app.report_btn, "「結果を開く」で、保存した結果の一覧（Excel で開ける）を見られる", 1500)
 
 
 @pattern("G3 書類と写真を、別々のフォルダに振り分けたい", gif="g03_sort")
 def g3(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\書類")
-    d.open_more()
-    d.type_into(d.app.exts_entry, d.app.exts_var, "pdf,docx,xlsx,txt", "種類（拡張子）に書類の拡張子を入れる")
-    d.run(dry_run=False)
+    d.type_into(d.app.exts_entry, d.app.exts_var, "pdf,docx,xlsx,txt", "④ の種類（拡張子）に書類の拡張子を入れる")
+    d.run()
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\写真")
     d.type_into(d.app.exts_entry, d.app.exts_var, "jpg", "種類（拡張子）を jpg に変える")
-    d.run(dry_run=False)
+    d.run()
     d.say("書類は Desktop\\書類、写真は Desktop\\写真 に分かれた", 2500)
 
 
@@ -266,24 +270,22 @@ def g3(d: Driver) -> None:
 def g4(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\写真")
-    d.open_more()
-    d.type_into(d.app.exts_entry, d.app.exts_var, "jpg", "種類（拡張子）に jpg を入れる")
-    d.click(d.app.dedupe_check, "「(1) 付きの重複ファイルを消す」にチェックを入れる",
-            lambda: d.app.dedupe_var.set(True))
-    d.run(dry_run=False)
+    d.type_into(d.app.exts_entry, d.app.exts_var, "jpg", "④ の種類（拡張子）に jpg を入れる")
+    d.point(d.app.dedupe_check, "「(1) 付きの重複ファイルを削除する」は最初からオン", 1200)
+    d.preview("一覧に「→ 重複を削除します」が出る")
+    d.execute()
     d.say("IMG_0001 (1).jpg は IMG_0001.jpg と中身が同じなので消えた", 2500)
 
 
-@pattern("G5 移す先に同じ名前のファイルがある", gif="g05_same-name",
+@pattern("G5 保存先に同じ名前のファイルがある", gif="g05_same-name",
          extra=[("Desktop/整理/メモ.txt", "前に書いたメモ\n", 30)])
 def g5(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Downloads")
     d.set_dest(f"{HOME_SHOWN}\\Desktop\\整理")
     d.choose_copy()
-    d.open_more()
     d.type_into(d.app.exts_entry, d.app.exts_var, "txt", "種類に txt を入れる（デスクトップにも別の メモ.txt がある）")
-    d.run(dry_run=False)
-    d.say("上書きせず、メモ_1.txt として両方残る（中身が同じなら作らない）", 2500)
+    d.run()
+    d.say("「同名ファイルの処理」は既定で「連番を付けて保存」。メモ_1.txt として両方残る", 2500)
 
 
 @pattern("G6 C ドライブが一杯なので、写真を D ドライブへ移したい", gif="g06_drive")
@@ -291,7 +293,7 @@ def g6(d: Driver) -> None:
     d.add_source(f"{HOME_SHOWN}\\Pictures\\旅行")
     d.set_dest(f"{D_SHOWN}\\写真\\旅行")
     d.choose_move()
-    d.run(dry_run=False)
+    d.run()
     d.say("ドライブをまたいでも、同じ操作で移せる（USB メモリや外付け HDD も同じ）", 2500)
 
 
@@ -327,10 +329,11 @@ def play(index: int, work: Path, *, record: bool, out_dir: Path = OUT_DIR, slow:
         root.withdraw()
     try:
         apply_theme(root)
-        app = App(root, ledger_path=sample.work / "ledger.jsonl", display=sample.shown,
+        app = App(root, ledger_path=sample.work / "ledger.jsonl", report_dir=sample.work / "履歴",
+                  display=sample.shown,
                   parse=lambda s: str(sample.real(s)) if s.startswith((HOME_SHOWN, D_SHOWN)) else s,
                   confirm=lambda *a: True, opener=lambda p: None)
-        root.geometry("820x860+40+40")
+        root.geometry("860x940+40+20")
         if record or snap:
             root.attributes("-topmost", True)   # 撮影するので手前に出す
         rec = Recorder(root, title, enabled=record or snap is not None, realtime=not (hidden or snap))
