@@ -1,3 +1,4 @@
 -r requirements.txt
 pytest>=8
 Pillow>=10   # デモの GIF 作成（demo/cli/make_gif.py、demo/gui/demo_gui.py の画面の撮影）
+pyinstaller>=6.16   # exe 化（tools/build_exe.py）

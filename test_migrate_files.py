@@ -15,6 +15,10 @@ migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテスト�
     - [P4] parse_since: 書式が不正（存在しない日付・単位違い・負数）なら ValueError
     - [P5] make_filter / check_paths / start_message（CLI・GUI 共通）: 入力の文字列から絞り込み条件を作り、
            移行先がファイル・移行元と同じなら ValueError。開始時の 1 行の文言
+    - [P6] make_filter(only=...): 渡したファイルだけを対象にし（大文字小文字・相対パスの違いは同じとみなす）、
+           後から増えたファイルは扱わない（GUI で「確認した一覧だけを実行する」ため）
+    - [P7] SYSTEM_EXCLUDES: desktop.ini・Thumbs.db・Office の一時ファイル・ダウンロード途中のファイルを除外し、
+           普通のファイルは除外しない（GUI が常に使う）
   transfer_file（1 ファイルの転送）
     - [T1] 正常にコピーでき、返り値の SHA-256 が移行元と一致し、.part が残らない
     - [T2] verify=False のときはハッシュを計算せず空文字を返す
@@ -23,6 +27,12 @@ migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテスト�
     - [T5] コピー途中の失敗でも .part が残らず、移行元も消えず、例外はそのまま伝わる
     - [T6] Ctrl+C 相当（KeyboardInterrupt）でも .part が残らない
     - [T7] 失敗しても、移行先にあった既存ファイルは壊さない
+    - [T8] 読み取り専用の移行元も移動でき（エクスプローラーと同じ）、読み取り専用の既存ファイルも上書きできる。
+           読み取り専用の .part も失敗時に片付く。使用中などで消せないものは失敗のまま
+    - [T9] 同じドライブの移動は名前の変更だけで行い、コピーもハッシュの計算もしない（中身・更新日時はそのまま）。
+           読み取り専用の移行元・既存ファイルも移せる
+    - [T10] 名前の変更で移せない（別のドライブ扱い）ときはコピー → 照合 → 削除に切り替える。別のドライブなら
+            最初からコピーで移す。使用中などで名前を変えられないときは、コピーせずに失敗のまま（元は残る）
   run_migration（全体の流れ）
     - [R1] should_cancel が True を返した時点で中断し、cancelled が立ち、残りは転送されない
     - [R2] 最初から中止なら 1 件も転送しない
@@ -59,7 +69,8 @@ migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテスト�
     - [E3] 中止したら、それ以降の通知は届かない
     - [E4] --move で移行先に同じ内容があり移行元だけ消したものは removed で届く（ドライランでも）
     - [E5] done / dryrun / skipped / removed には移行先（dest）が入り、skipped / removed には
-           理由（reason: done / exists / same）が入る（GUI の結果の一覧が依存する）
+           理由（reason: done / exists / same）が入る。scanned 以外には移行元（src）が入る
+           （GUI の結果の一覧と、確認した一覧だけを実行する仕組みが依存する）
   CLI のデモ（demo/cli/demo.py と、その GIF を作る demo/cli/make_gif.py）
     - [G1] デモの全 12 パターンが指定した作業フォルダで最後まで動き、片付け・重複削除・指定ミス・
            ドライブ間の移動が期待どおりになる。表示には実際の作業フォルダのパスを出さない
@@ -221,6 +232,35 @@ def test_P5_make_filter_and_check_paths(tmp_path):
     assert mf.start_message([src, src], tmp_path, move=False, dry_run=False).endswith("ほか 1 件 -> " + f"{tmp_path}（コピー）")
 
 
+def test_P6_filter_only(tmp_path, monkeypatch):
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    (src / "sub").mkdir(parents=True)
+    for rel in ("a.txt", "b.txt", "sub/c.txt"):
+        (src / rel).write_text(rel, encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    only = [Path("src") / "a.txt", str(src / "SUB" / "c.txt") if os.name == "nt" else str(src / "sub" / "c.txt")]
+
+    (src / "new.txt").write_text("後から増えた", encoding="utf-8")
+    result = mf.run_migration(src, dst, filt=mf.make_filter(only=only))
+
+    assert result.copied == 2
+    assert sorted(p.relative_to(dst).as_posix() for p in dst.rglob("*") if p.is_file()) == ["a.txt", "sub/c.txt"]
+    assert mf.make_filter().only is None and mf.make_filter(only=[]).only == frozenset()
+
+
+def test_P7_system_excludes(tmp_path):
+    src = tmp_path / "Downloads"
+    (src / "資料").mkdir(parents=True)
+    names = ["desktop.ini", "Thumbs.db", "~$議事録.docx", "setup.exe.crdownload", "動画.mp4.part",
+             "a.partial", "b.download", "資料/desktop.ini", "議事録.docx", "report.pdf", "part.txt", "資料/a.txt"]
+    for n in names:
+        (src / n).write_text(n, encoding="utf-8")
+
+    found = mf.collect_files(src, tmp_path / "dst", mf.make_filter(excludes=mf.SYSTEM_EXCLUDES))
+
+    assert sorted(f.relative_to(src).as_posix() for f in found) == ["part.txt", "report.pdf", "議事録.docx", "資料/a.txt"]
+
+
 # ================================================================ transfer_file
 
 def _corrupt_copy(src: Path, tmp: Path) -> None:
@@ -260,7 +300,7 @@ def test_T3_move_removes_source(src_file, dest):
 @pytest.mark.parametrize("move", [False, True])
 def test_T4_hash_mismatch(src_file, dest, move):
     with pytest.raises(IOError, match="ハッシュが一致しません"):
-        mf.transfer_file(src_file, dest, move=move, copy_fn=_corrupt_copy)
+        mf.transfer_file(src_file, dest, move=move, rename=False, copy_fn=_corrupt_copy)
 
     assert not dest.exists()
     assert not _part(dest).exists()
@@ -271,7 +311,7 @@ def test_T4_hash_mismatch(src_file, dest, move):
                          ids=["T5_oserror", "T6_interrupt"])
 def test_T5_T6_failure_mid_copy(src_file, dest, exc):
     with pytest.raises(type(exc)):
-        mf.transfer_file(src_file, dest, move=True, copy_fn=_failing_copy(exc))
+        mf.transfer_file(src_file, dest, move=True, rename=False, copy_fn=_failing_copy(exc))
 
     assert not dest.exists()
     assert not _part(dest).exists()
@@ -286,6 +326,110 @@ def test_T7_failure_keeps_existing_dest(src_file, dest):
         mf.transfer_file(src_file, dest, copy_fn=_corrupt_copy)
 
     assert dest.read_bytes() == b"existing"
+
+
+def _no_copy(*a, **kw):
+    raise AssertionError("コピー・ハッシュの計算はしないはず")
+
+
+def test_T9_same_drive_move_by_rename(tmp_path, monkeypatch):
+    import stat
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    (src / "a.txt").write_text("中身", encoding="utf-8")
+    os.utime(src / "a.txt", (1_700_000_000, 1_700_000_000))
+    (src / "ro.txt").write_text("読み取り専用", encoding="utf-8")
+    os.chmod(src / "ro.txt", stat.S_IREAD)
+    (dst / "sub").mkdir(parents=True)
+    (dst / "sub" / "ro.txt").write_text("古い", encoding="utf-8")
+    os.chmod(dst / "sub" / "ro.txt", stat.S_IREAD)
+    monkeypatch.setattr(mf, "sha256_of", _no_copy)
+
+    assert mf.transfer_file(src / "a.txt", dst / "a.txt", move=True, copy_fn=_no_copy) == ""
+    mf.transfer_file(src / "ro.txt", dst / "sub" / "ro.txt", move=True, copy_fn=_no_copy)   # 上書き
+
+    assert _names(src) == []
+    assert (dst / "a.txt").read_text(encoding="utf-8") == "中身"
+    assert (dst / "a.txt").stat().st_mtime == 1_700_000_000
+    assert (dst / "sub" / "ro.txt").read_text(encoding="utf-8") == "読み取り専用"
+
+
+def test_T10_rename_fallback_and_failure(tmp_path, monkeypatch):
+    import errno
+    src_file = tmp_path / "src" / "a.txt"
+    src_file.parent.mkdir()
+    src_file.write_bytes(b"hello")
+    real_replace = mf.os.replace
+    calls = []
+
+    def replace(error):
+        def fake(x, y):
+            if Path(x) == src_file:      # 移行元からの名前の変更だけ失敗させる（.part からの置き換えは通す）
+                calls.append(x)
+                raise error
+            return real_replace(x, y)
+        return fake
+
+    # 名前の変更で移せない（別のドライブ扱い）-> コピー -> 照合 -> 削除
+    monkeypatch.setattr(mf.os, "replace", replace(OSError(errno.EXDEV, "別のドライブ")))
+    assert mf.transfer_file(src_file, tmp_path / "dst" / "a.txt", move=True) == _sha(b"hello")
+    assert len(calls) == 1 and not src_file.exists() and (tmp_path / "dst" / "a.txt").read_bytes() == b"hello"
+
+    # 別のドライブなら最初からコピーで移す
+    src_file.write_bytes(b"hello")
+    monkeypatch.setattr(mf, "_same_drive", lambda a, b: False)
+    assert mf.transfer_file(src_file, tmp_path / "d2" / "a.txt", move=True) == _sha(b"hello")
+    assert len(calls) == 1
+
+    # 使用中などで名前を変えられないときは、コピーせずに失敗のまま
+    src_file.write_bytes(b"hello")
+    monkeypatch.setattr(mf, "_same_drive", lambda a, b: True)
+    monkeypatch.setattr(mf.os, "replace", replace(PermissionError(errno.EACCES, "使用中です")))
+    with pytest.raises(PermissionError):
+        mf.transfer_file(src_file, tmp_path / "d3" / "a.txt", move=True, copy_fn=_no_copy)
+    assert src_file.exists() and not (tmp_path / "d3" / "a.txt").exists()
+
+
+def test_T8_read_only_files(tmp_path, monkeypatch):
+    import stat
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (src / "ro.txt").write_text("読み取り専用", encoding="utf-8")
+    os.chmod(src / "ro.txt", stat.S_IREAD)
+    (src / "new.txt").write_text("新しい", encoding="utf-8")
+    (dst / "new.txt").write_text("古い", encoding="utf-8")
+    os.chmod(dst / "new.txt", stat.S_IREAD)
+
+    result = mf.run_migration(src, dst, move=True, on_exists="overwrite")
+
+    assert result.ok and result.copied == 2
+    assert _names(src) == []
+    assert (dst / "ro.txt").read_text(encoding="utf-8") == "読み取り専用"
+    assert (dst / "new.txt").read_text(encoding="utf-8") == "新しい"
+
+    # 読み取り専用の .part も、失敗したら片付く
+    (src / "ro2.txt").write_text("x", encoding="utf-8")
+    os.chmod(src / "ro2.txt", stat.S_IREAD)
+
+    def copy_then_fail(a, b):
+        mf.shutil.copy2(a, b)   # 読み取り専用の属性も写る
+        raise OSError("ディスクがいっぱいです")
+    with pytest.raises(OSError):
+        mf.transfer_file(src / "ro2.txt", dst / "ro2.txt", copy_fn=copy_then_fail)
+    assert not _part(dst / "ro2.txt").exists()
+
+    # 使用中など（読み取り専用ではない）で消せないものは、失敗のまま
+    real = Path.unlink
+
+    def busy(self, *a, **kw):
+        if self.name == "busy.txt":
+            raise PermissionError("使用中です")
+        return real(self, *a, **kw)
+    (src / "busy.txt").write_text("b", encoding="utf-8")
+    monkeypatch.setattr(Path, "unlink", busy)
+    with pytest.raises(PermissionError, match="使用中です"):
+        mf.remove_file(src / "busy.txt")
 
 
 # ================================================================ run_migration
@@ -719,6 +863,7 @@ def test_E5_progress_dest_and_reason(tree, tmp_path):
     ledger = mf.Ledger(tmp_path / "ledger.jsonl")
 
     _, events = _collect(src, dst, move=True, ledger=ledger)
+    assert events[0].src == "" and [e.src for e in events[1:]] == [str(src / n) for n in ("a.txt", "b.txt", "c.txt")]
     assert [(e.status, e.dest, e.reason) for e in events[1:]] == [
         ("skipped", str(dst / "a.txt"), "exists"),
         ("removed", str(dst / "b.txt"), "same"),

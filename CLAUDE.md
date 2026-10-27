@@ -15,6 +15,7 @@
 | `docs/images/cli/` / `docs/images/gui/` | CLI / GUI のデモの GIF |
 | `requirements.txt` / `requirements-dev.txt` | GUI の追加ライブラリ（無くても動く） / テスト・デモ用 |
 | `.claude/skills/gui-check/` | GUI の画面を撮って見た目を確かめる手順（skill） |
+| `tools/build_exe.py` | GUI を exe（`dist/FileMove.exe`）にする。自己署名の証明書で署名し、作った後に `--self-test` で自己診断 |
 
 ## 実装とテストは必ずセットで行う
 
@@ -45,7 +46,10 @@ python -m pytest test_gui.py        # GUI だけ
 - GUI に処理を書かない。新しい機能はまず本体に足し、CLI と GUI の両方から使えるようにする。CLI の `main()` にしか無い処理を GUI で使いたくなったら、本体の関数に切り出す
 - GUI は今のところ Windows 向け。Windows 専用の機能（レジストリ、Windows だけのライブラリ）は使わず、後から Mac・Linux に広げられるようにしておく
 - GUI の追加ライブラリ（`requirements.txt` の sv-ttk・tkinterdnd2）は、入っていなくても動くようにする（見た目が古くなる・ドラッグ＆ドロップが使えないだけ）
-- GUI はシンプルに保つ。上から「① 移すもの → ② 移す先 → ③ 移動かコピーか → 実行」の順で、細かい設定は「詳細設定」に畳む。結果は見出しと 1 ファイルずつの一覧で、終わったか・何が残ったかがひと目で分かるようにする。結果の言葉は `gui/runner.py`（画面に依存しない）に書く
+- GUI はシンプルに保つ。上から「① 対象フォルダ → ② 保存先フォルダ → ③ 処理方法 → ④ 詳細設定 → 確認 → 実行」の順。対象はフォルダだけ。結果は大きな見出し・太い進捗バーと 1 ファイルずつの一覧で、終わったか・何が残ったかがひと目で分かるようにする。結果の言葉と保存は `gui/runner.py`（画面に依存しない）に書く
+- 「実行」は「確認」の後でないと押せず、実行するのは確認した一覧のファイルだけ（`run_migration` の `filt.only`）。確認の後に入力が変わったら確認をやり直させる。この決まりは崩さない
+- `desktop.ini`・Office の一時ファイル・ダウンロード途中のファイル（`SYSTEM_EXCLUDES`）は GUI では常に移さない
+- exe に関わる変更（ライブラリの追加、データファイル、起動の仕方）をしたら `python tools/build_exe.py` で作り直し、自己診断（`test_gui.py` の X1 も）が通ることを確かめる
 
 ## デモ
 

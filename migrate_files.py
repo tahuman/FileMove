@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import fnmatch
 import glob
 import hashlib
@@ -32,6 +33,7 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
@@ -41,6 +43,13 @@ from typing import Callable, Iterable, Sequence
 
 CHUNK_SIZE = 1024 * 1024  # 1MB
 LOGGER = logging.getLogger("migrate")
+
+# 移してはいけない・移す意味のないファイル（GUI では常に除外する。CLI では --exclude で指定できる）
+#   desktop.ini / Thumbs.db: Windows がフォルダごとに置く隠しファイル（desktop.ini を動かすと
+#                            「ダウンロード」などのフォルダの表示名やアイコンが崩れる）
+#   ~$*: Office で開いているファイルの一時ファイル
+#   *.crdownload / *.part / *.partial / *.download: ダウンロード途中のファイル（Chrome・Edge / Firefox / Safari）
+SYSTEM_EXCLUDES = ("desktop.ini", "Thumbs.db", "~$*", "*.crdownload", "*.part", "*.partial", "*.download")
 
 
 # ================================================================ 値のパース
@@ -134,13 +143,25 @@ def resolve_destination(dest: Path, policy: str,
 def transfer_file(src_file: Path, dest: Path, *,
                   move: bool = False,
                   verify: bool = True,
+                  rename: bool = True,
                   copy_fn: Callable[[Path, Path], object] = shutil.copy2) -> str:
-    """1 ファイルを転送する。検証済みの SHA-256（verify=False なら空文字）を返す。
+    """1 ファイルを転送する。検証済みの SHA-256（verify=False・名前の変更で移したときは空文字）を返す。
 
     一時ファイル(.part)に書いてから rename するので、途中で落ちても
     中途半端なファイルが移行先に残らない。移行元の削除は検証が通った後だけ。
+
+    move で、移行元と移行先が同じドライブなら、中身はコピーせずに名前の変更だけで移す
+    （エクスプローラーの移動と同じ。中身に触らないので照合も要らず、一瞬で終わる）。
+    rename=False ならドライブに関係なくコピー → 照合 → 削除で移す。
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if move and rename and _same_drive(src_file, dest.parent):
+        try:
+            return _move_by_rename(src_file, dest)
+        except OSError as e:
+            if not _cross_device(e):
+                raise   # 使用中などは失敗のまま（コピーに切り替えると、元が消せずに 2 つになる）
+            # 同じドライブに見えても名前の変更で移せない（ネットワークドライブなど）ときはコピーで移す
     tmp = dest.with_name(dest.name + ".part")
 
     try:
@@ -153,15 +174,53 @@ def transfer_file(src_file: Path, dest: Path, *,
                 raise IOError("転送後のハッシュが一致しません"
                               "（転送先の破損、またはコピー中に移行元が更新された）")
 
+        if dest.exists() and not os.access(dest, os.W_OK):
+            os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)   # 読み取り専用の既存ファイルも上書きできるように
         os.replace(tmp, dest)  # 同一ディレクトリ内なのでほぼアトミック
     except BaseException:
-        Path(tmp).unlink(missing_ok=True)  # 失敗したら痕跡を残さない
+        remove_file(Path(tmp), missing_ok=True)  # 失敗したら痕跡を残さない
         raise
 
     if move:
-        src_file.unlink()
+        remove_file(src_file)
 
     return digest
+
+
+def _same_drive(src_file: Path, dest_dir: Path) -> bool:
+    """同じドライブ（ボリューム）にあるか。"""
+    try:
+        return os.stat(src_file).st_dev == os.stat(dest_dir).st_dev
+    except OSError:
+        return False
+
+
+def _cross_device(e: OSError) -> bool:
+    """「別のドライブには名前の変更で移せない」エラーか（Windows は ERROR_NOT_SAME_DEVICE = 17）。"""
+    return e.errno == errno.EXDEV or getattr(e, "winerror", None) == 17
+
+
+def _move_by_rename(src_file: Path, dest: Path) -> str:
+    """同じドライブの中で、名前の変更だけで移す。移した後に大きさが同じかを確かめる。"""
+    size = src_file.stat().st_size
+    if dest.exists() and not os.access(dest, os.W_OK):
+        os.chmod(dest, stat.S_IWRITE | stat.S_IREAD)   # 読み取り専用の既存ファイルも上書きできるように
+    os.replace(src_file, dest)   # 同じドライブなら中身は動かさず、一瞬で終わる（失敗しても元はそのまま）
+    if dest.stat().st_size != size:
+        raise IOError("移動後の大きさが一致しません")
+    return ""
+
+
+def remove_file(path: Path, *, missing_ok: bool = False) -> None:
+    """ファイルを削除する。読み取り専用で消せなければ、読み取り専用を外してから消す
+    （Windows では読み取り専用のファイルは削除できないが、エクスプローラーの移動では消える）。"""
+    try:
+        path.unlink(missing_ok=missing_ok)
+    except PermissionError:
+        if os.access(path, os.W_OK):
+            raise   # 読み取り専用ではない（使用中など）ので、そのまま失敗とする
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+        path.unlink(missing_ok=missing_ok)
 
 
 # ================================================================ 台帳（再開用）
@@ -169,6 +228,13 @@ def transfer_file(src_file: Path, dest: Path, *,
 def _root_id(path: Path) -> str:
     """台帳で移行元／移行先を識別するための文字列（Windows では大文字小文字を同一視）。"""
     return os.path.normcase(str(Path(path).resolve()))
+
+
+def _path_id(path: Path) -> str:
+    """1 ファイル・1 フォルダを見分けるための文字列（Windows では大文字小文字を同一視）。
+    走査で見つけたもの同士を比べるだけなので、重い resolve()（リンクをたどる）はしない。
+    1 件ごとに何度も呼ぶので、ここが重いと数千件で数秒かかる。"""
+    return os.path.normcase(os.path.abspath(path))
 
 
 class Ledger:
@@ -262,11 +328,14 @@ class FileFilter:
     since: float | None = None               # この epoch 秒以降に更新されたもの
     min_size: int | None = None
     max_size: int | None = None
+    only: Iterable[Path | str] | None = None   # このファイルだけ（GUI で確認した一覧。後から増えたものは扱わない）
 
     def __post_init__(self):
         if self.exts is not None:
             self.exts = frozenset(e.lower().lstrip(".") for e in self.exts)
         self.excludes = tuple(self.excludes)
+        if self.only is not None:
+            self.only = frozenset(_path_id(Path(p)) for p in self.only)
 
     def excluded(self, name: str, rel: str) -> bool:
         return any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(rel, p)
@@ -280,6 +349,8 @@ class FileFilter:
         if self.min_size is not None and st.st_size < self.min_size:
             return False
         if self.max_size is not None and st.st_size > self.max_size:
+            return False
+        if self.only is not None and _path_id(path) not in self.only:
             return False
         return True
 
@@ -346,6 +417,7 @@ class ProgressEvent:
     "failed" / "dryrun" のいずれか。
     dest は置いた（置く予定の）移行先、reason は skipped / removed の理由
     （"done" 台帳で処理済み / "exists" 同名の別のファイルがある / "same" 同じ内容が既にある）。
+    src は移行元のファイル（scanned 以外）。
     """
     status: str
     index: int = 0
@@ -355,6 +427,7 @@ class ProgressEvent:
     error: str = ""
     dest: str = ""
     reason: str = ""
+    src: str = ""
 
 
 @dataclass
@@ -400,7 +473,7 @@ def collect_targets(sources: Sequence[Path], dst: Path, filt: FileFilter,
     for root in sources:
         base = root.parent if root.is_file() else root
         for f in collect_files(root, dst, filt, log=log):
-            key = _root_id(f)
+            key = _path_id(f)
             if key in seen:
                 continue
             seen.add(key)
@@ -458,14 +531,14 @@ def run_migration(src, dst, *,
     seen_dirs: set[str] = set()
     for t in targets:
         d = (dst / t.rel).parent
-        if _root_id(d) not in seen_dirs:
-            seen_dirs.add(_root_id(d))
+        if _path_id(d) not in seen_dirs:
+            seen_dirs.add(_path_id(d))
             result.dest_dirs.append(d)
 
     # この実行で置いた（ドライランなら置く予定の）移行先。同名ファイルが複数あるとき、
     # ドライランでも実際の実行と同じ判定になるようにする。
     placed: set[str] = set()
-    exists = lambda p: p.exists() or _root_id(p) in placed  # noqa: E731
+    exists = lambda p: p.exists() or _path_id(p) in placed  # noqa: E731
     moved: list[_Target] = []   # 移行元から消したもの（空になったフォルダを後で消す）
 
     def drop_source(i: int, t: _Target) -> bool:
@@ -473,24 +546,27 @@ def run_migration(src, dst, *,
         失敗したら failed として扱い False を返す。"""
         if not dry_run:
             try:
-                t.path.unlink()
+                remove_file(t.path)
             except OSError as e:
                 result.failed += 1
                 result.failures.append((t.shown, str(e)))
                 log.error("[%d/%d] 移行元を削除できません %s: %s", i, total, t.shown, e)
-                emit(ProgressEvent("failed", i, total, t.rel, error=str(e)))
+                emit(ProgressEvent("failed", i, total, t.rel, error=str(e), src=str(t.path)))
                 return False
         result.skipped += 1
         result.sources_removed += 1
         log.info("[%d/%d] %s移行先に同じ内容があるため移行元を削除: %s",
                  i, total, "DRY-RUN " if dry_run else "", t.shown)
-        emit(ProgressEvent("removed", i, total, t.rel, dest=str(dst / t.rel), reason="same"))
+        emit(ProgressEvent("removed", i, total, t.rel, dest=str(dst / t.rel), reason="same", src=str(t.path)))
         moved.append(t)
         return True
 
+    bound = None
     for i, t in enumerate(targets, 1):
         f, rel, shown = t.path, t.rel, t.shown
-        ledger.bind(t.root, dst)  # 台帳は「指定された移行元 → 移行先」ごとに区別する
+        if t.root is not bound:   # 台帳は「指定された移行元 → 移行先」ごとに区別する（bind は重いので変わったときだけ）
+            ledger.bind(t.root, dst)
+            bound = t.root
 
         if should_cancel is not None and should_cancel():
             result.cancelled = True
@@ -507,7 +583,7 @@ def run_migration(src, dst, *,
                     result.skipped += 1
                     result.already_done += 1
                     log.debug("[%d/%d] 済: %s", i, total, shown)
-                    emit(ProgressEvent("skipped", i, total, rel, dest=str(copied_to), reason="done"))
+                    emit(ProgressEvent("skipped", i, total, rel, dest=str(copied_to), reason="done", src=str(f)))
                 continue
             log.info("[%d/%d] 台帳では処理済みですが、移行先に見当たらないため転送し直します: %s",
                      i, total, shown)
@@ -523,7 +599,7 @@ def run_migration(src, dst, *,
             result.skipped += 1
             log.info("[%d/%d] 移行先に同じ内容があるためスキップ: %s", i, total, shown)
             ledger.record(rel, "done", dest=os.path.abspath(dst / rel), reason="same_content")
-            emit(ProgressEvent("skipped", i, total, rel, dest=str(dst / rel), reason="same"))
+            emit(ProgressEvent("skipped", i, total, rel, dest=str(dst / rel), reason="same", src=str(f)))
             continue
 
         dest = resolve_destination(dst / rel, on_exists, exists)
@@ -531,15 +607,15 @@ def run_migration(src, dst, *,
             result.skipped += 1
             log.info("[%d/%d] 既存のためスキップ: %s", i, total, shown)
             ledger.record(rel, "skipped", reason="exists")
-            emit(ProgressEvent("skipped", i, total, rel, dest=str(dst / rel), reason="exists"))
+            emit(ProgressEvent("skipped", i, total, rel, dest=str(dst / rel), reason="exists", src=str(f)))
             continue
 
-        placed.add(_root_id(dest))
+        placed.add(_path_id(dest))
         result.placed[dest] = f
         if dry_run:
             result.copied += 1
             log.info("[%d/%d] DRY-RUN %s -> %s", i, total, shown, dest)
-            emit(ProgressEvent("dryrun", i, total, rel, dest=str(dest)))
+            emit(ProgressEvent("dryrun", i, total, rel, dest=str(dest), src=str(f)))
             continue
 
         try:
@@ -550,7 +626,7 @@ def run_migration(src, dst, *,
             # 別の場所から実行しても同じファイルを指すよう、絶対パスで記録する
             ledger.record(rel, "done", dest=os.path.abspath(dest), size=size, sha256=digest)
             log.info("[%d/%d] OK %s (%s)", i, total, shown, human(size))
-            emit(ProgressEvent("done", i, total, rel, size=size, dest=str(dest)))
+            emit(ProgressEvent("done", i, total, rel, size=size, dest=str(dest), src=str(f)))
             if move:
                 moved.append(t)
         except Exception as e:  # 1 件の失敗で全体を止めない
@@ -558,7 +634,7 @@ def run_migration(src, dst, *,
             result.failures.append((shown, str(e)))
             ledger.record(rel, "failed", error=str(e))
             log.error("[%d/%d] 失敗 %s: %s", i, total, shown, e)
-            emit(ProgressEvent("failed", i, total, rel, error=str(e)))
+            emit(ProgressEvent("failed", i, total, rel, error=str(e), src=str(f)))
 
     if moved and not dry_run:
         result.dirs_removed = remove_empty_dirs(moved, log=log)
@@ -583,7 +659,7 @@ def remove_empty_dirs(moved: Iterable[_Target], log: logging.Logger | None = Non
             continue
         d = t.path.parent
         while d != t.root and t.root in d.parents:
-            candidates.setdefault(_root_id(d), d)
+            candidates.setdefault(_path_id(d), d)
             d = d.parent
     removed: list[Path] = []
     for d in sorted(candidates.values(), key=lambda p: len(p.parts), reverse=True):
@@ -616,17 +692,17 @@ def find_duplicates(dirs: Iterable[Path],
     upcoming: dict[str, dict[str, tuple[str, Path]]] = {}
     for dest, src in (planned or {}).items():
         if not dest.exists():
-            upcoming.setdefault(_root_id(dest.parent), {})[os.path.normcase(dest.name)] = (dest.name, src)
+            upcoming.setdefault(_path_id(dest.parent), {})[os.path.normcase(dest.name)] = (dest.name, src)
 
     pairs: list[tuple[Path, Path]] = []
     seen: set[str] = set()
     for d in map(Path, dirs):
-        if _root_id(d) in seen:
+        if _path_id(d) in seen:
             continue
-        seen.add(_root_id(d))
+        seen.add(_path_id(d))
         entries = {os.path.normcase(p.name): (p.name, p)
                    for p in (d.iterdir() if d.is_dir() else ()) if p.is_file()}
-        entries.update(upcoming.get(_root_id(d), {}))
+        entries.update(upcoming.get(_path_id(d), {}))
         for name, content in sorted(entries.values()):
             m = _NUMBERED.match(name)
             original = m and entries.get(os.path.normcase(m["stem"] + m["ext"]))
@@ -654,10 +730,10 @@ def remove_duplicates(dirs: Iterable[Path], *, root: Path | None = None,
     """
     log = log or LOGGER
     result = DedupeResult()
-    sources = {_root_id(k): v for k, v in (planned or {}).items()}
+    sources = {_path_id(k): v for k, v in (planned or {}).items()}
     for dup, original in find_duplicates(dirs, planned):
         shown = dup.relative_to(root).as_posix() if root else str(dup)
-        size = (dup if dup.exists() else sources[_root_id(dup)]).stat().st_size
+        size = (dup if dup.exists() else sources[_path_id(dup)]).stat().st_size
         if not dry_run:
             try:
                 dup.unlink()
@@ -718,12 +794,13 @@ def start_message(sources: Sequence[Path], dst: Path, *, move: bool, dry_run: bo
 
 
 def make_filter(ext: str | None = None, excludes: Sequence[str] = (), since: str | None = None,
-                min_size: str | None = None, max_size: str | None = None) -> FileFilter:
+                min_size: str | None = None, max_size: str | None = None,
+                only: Iterable[Path | str] | None = None) -> FileFilter:
     """入力された文字列（"pdf,jpg"、"30d"、"10MB" など）から絞り込み条件を作る。
-    書式が不正なら ValueError（CLI・GUI 共通）。"""
+    書式が不正なら ValueError（CLI・GUI 共通）。only を渡すと、そのファイルだけを対象にする。"""
     exts = [e.strip() for e in ext.split(",") if e.strip()] if ext and ext.strip() else None
     return FileFilter(exts=exts, excludes=excludes, since=parse_since(since),
-                      min_size=parse_size(min_size), max_size=parse_size(max_size))
+                      min_size=parse_size(min_size), max_size=parse_size(max_size), only=only)
 
 
 def setup_logging(log_path: Path | None, verbose: bool) -> None:
@@ -754,7 +831,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "ディレクトリは中身を構成ごと、ファイルは移行先直下に送る")
     p.add_argument("--move", action="store_true",
                    help="検証成功後に移行元を削除する。移行先に同じ内容が既にあるものも移行元を削除する。"
-                        "空になった移行元のフォルダも消す")
+                        "空になった移行元のフォルダも消す。同じドライブの中なら、コピーせずに名前の変更だけで移す")
     p.add_argument("--dedupe", action="store_true",
                    help="転送後、今回ファイルを置いた移行先のフォルダで `name (1).ext` のような"
                         "番号付きファイルが番号なしのものと同じ内容なら削除する")
