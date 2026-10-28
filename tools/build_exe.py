@@ -28,13 +28,38 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))   # migrate_files（バージョン）
 DIST, BUILD = ROOT / "dist", ROOT / "build"
 EXE = DIST / "FileMove.exe"
 CERT_SUBJECT = "CN=FileMove (self-signed)"
 
 
+def write_version_file(path: Path) -> Path:
+    """exe のファイルのプロパティ（詳細タブ）に出すバージョン情報を、PyInstaller の形式で書く。"""
+    from migrate_files import __version__
+    nums = tuple(int(n) for n in __version__.split(".")) + (0,)
+    file_version = ".".join(map(str, nums))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"""VSVersionInfo(
+  ffi=FixedFileInfo(filevers={nums}, prodvers={nums}),
+  kids=[
+    StringFileInfo([StringTable('041104B0', [
+      StringStruct('ProductName', 'FileMove'),
+      StringStruct('FileDescription', 'FileMove（フォルダの構成を保ったままファイルを移動・コピー）'),
+      StringStruct('ProductVersion', '{__version__}'),
+      StringStruct('FileVersion', '{file_version}'),
+      StringStruct('OriginalFilename', 'FileMove.exe'),
+      StringStruct('LegalCopyright', 'tahuman')])]),
+    VarFileInfo([VarStruct('Translation', [0x0411, 1200])])
+  ]
+)
+""", encoding="utf-8")
+    return path
+
+
 def build() -> None:
     import PyInstaller.__main__
+    version_file = write_version_file(BUILD / "version_info.txt")
     PyInstaller.__main__.run([
         str(ROOT / "gui" / "FileMove.pyw"),
         "--name", "FileMove",
@@ -42,6 +67,7 @@ def build() -> None:
         "--paths", str(ROOT),                      # migrate_files と gui
         "--collect-data", "sv_ttk",                # 見た目（テーマの画像と tcl）
         "--collect-all", "tkinterdnd2",            # ドラッグ＆ドロップ（tkdnd の DLL）
+        "--version-file", str(version_file),       # ファイルのプロパティのバージョン
         "--distpath", str(DIST), "--workpath", str(BUILD / "work"), "--specpath", str(BUILD),
     ])
 

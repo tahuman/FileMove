@@ -21,6 +21,7 @@ FileMove（`migrate_files.py`）は、たくさんのファイルを一度にコ
 
 ```
 python migrate_files.py --help
+python migrate_files.py --version   # FileMove 1.0.0
 ```
 
 ---
@@ -194,6 +195,7 @@ python migrate_files.py 移行元 移行先             ← ② 実行（コピ�
 | `--restart` | 台帳を無視して最初から | |
 | `--log パス` | ログファイル | `migration.log` |
 | `-v`, `--verbose` | 台帳で飛ばしたものも 1 件ずつ表示 | |
+| `--version` | バージョンを表示して終わる | |
 
 ---
 

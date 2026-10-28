@@ -41,6 +41,7 @@ migrate_files.py（本体と CLI）のテスト（pytest）。GUI のテスト�
     - [R5] 台帳で done でも、移行先から消えていれば転送し直す（コピー・--move とも）
     - [R6] 台帳の dest は絶対パスで記録し、旧版の相対パスの記録は移行先/相対パスで照合する
     - [C1] 標準出力が cp932（出力をファイルに書き出したとき）でも、絵文字のファイル名でログが壊れない
+    - [C2] --version で「FileMove 1.0.0」の形のバージョンを表示して exit 0（移行元・移行先が無くてもよい）
   --move の移行元の片付け
     - [V1] same_content: 中身が同じなら True。中身・サイズが違う、どちらかが無いなら False
     - [V2] 移行先に同じ内容があれば転送せず移行元を削除し、台帳は done。中身が違えば移行元は残る
@@ -87,6 +88,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
@@ -529,6 +531,15 @@ def test_R6_ledger_dest_is_absolute(tree, tmp_path, monkeypatch):
 
     assert result.sources_removed == 3
     assert _names(src) == []
+
+
+def test_C2_version(capsys):
+    with pytest.raises(SystemExit) as e:
+        mf.main(["--version"])
+
+    assert e.value.code == 0
+    assert capsys.readouterr().out == f"FileMove {mf.__version__}\n"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", mf.__version__)
 
 
 @pytest.mark.scenario

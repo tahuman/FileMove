@@ -123,6 +123,7 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | M12 | M1 に `--ext pdf` | 成功 1 |
 | M13 | 引数が 1 つだけ | 使い方エラー / exit 2 |
 | M14 | 移行先を `src/docs` にして `docs/report_2026.PDF` を含める | 「移行元と移行先が同じです」/ exit 2 |
+| M15 | `--version`（移行元・移行先なし） | 「FileMove 1.0.0」と表示 / exit 0 |
 
 ## 重複ファイルの削除（--dedupe）
 

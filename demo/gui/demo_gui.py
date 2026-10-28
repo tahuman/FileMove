@@ -37,6 +37,7 @@ from sample import D_SHOWN, HOME_SHOWN, Sample  # noqa: E402
 
 OUT_DIR = ROOT / "docs" / "images" / "gui"
 FRAME_MS = 100          # 録画の間隔
+FRAME_PX = 6            # 画像のまわりの黒い枠の太さ
 SLOW_PER_FILE = 0.15    # 進捗が見えるよう、1 ファイルごとに待つ秒数（デモのときだけ）
 
 PATTERNS: list = []
@@ -126,8 +127,11 @@ def _font(size: int, bold: bool = False):
 
 
 def compose(window, title: str, caption: str, pointer: tuple[int, int] | None):
-    """撮影した画面に、Windows 11 風のタイトルバーと、下に説明の帯を付ける。"""
-    from PIL import Image, ImageDraw
+    """撮影した画面に、Windows 11 風のタイトルバーと、下に説明の帯を付け、まわりを黒い枠で囲む。
+
+    画面が白っぽく、README などの白い背景と境目が分からないので、枠（FRAME_PX）で区切る。
+    """
+    from PIL import Image, ImageDraw, ImageOps
     bar_h, cap_h = 34, 64
     w, h = window.size
     img = Image.new("RGB", (w, bar_h + h + cap_h), (250, 250, 250))
@@ -156,7 +160,7 @@ def compose(window, title: str, caption: str, pointer: tuple[int, int] | None):
     d.rectangle((0, top, w, top + cap_h), fill=(32, 32, 32))
     d.text((16, top + 18), title, font=_font(17, bold=True), fill=(97, 214, 214), anchor="lm")
     d.text((16, top + 45), caption, font=_font(15), fill=(235, 235, 235), anchor="lm")
-    return img
+    return ImageOps.expand(img, border=FRAME_PX, fill=(0, 0, 0))
 
 
 # ---------------------------------------------------------------- 操作
