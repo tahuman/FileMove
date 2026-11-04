@@ -49,10 +49,6 @@ def files(base: Path) -> set[str]:
     return {p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_file()}
 
 
-def dirs(base: Path) -> set[str]:
-    return {p.relative_to(base).as_posix() for p in base.rglob("*") if p.is_dir()}
-
-
 def expect(cond: bool, msg: str) -> None:
     if not cond:
         raise AssertionError(msg)
@@ -84,24 +80,16 @@ SCENARIOS: list[Scenario] = [
     Scenario("10", "overwrite", [S(), DST, "--on-exists", "overwrite"], counts=(24, 0, 0),
              check=lambda o: expect(read(DST / "conflict/same.txt") == "NEW (src)\n", "上書きされない")),
     Scenario("11", "台帳から再開", [S(), DST, "--log", W / "m.log", "--ledger", W / "ledger_partial.jsonl"],
-             std_ledger=False, counts=(22, 2, 0),
-             check=lambda o: (expect(o.count("移行先に見当たらないため転送し直します") == 2,
-                                     "done だが移行先に無いものが転送し直されない"),
+             std_ledger=False, counts=(20, 4, 0),
+             check=lambda o: (expect(not (DST / "docs/report_2025.pdf").exists(), "done がコピーされた"),
                               expect(all((DST / p).exists() for p in
-                                         ["docs/report_2025.pdf", "data/sales.csv",
-                                          "data/sales.xlsx", "images/photo1.jpg", "empty_file.txt",
+                                         ["data/sales.xlsx", "images/photo1.jpg", "empty_file.txt",
                                           "no_extension", "archive.tar.gz"]), "再処理されないものがある"))),
-    Scenario("11b", "同じ台帳で再実行", [S(), DST, "--log", W / "m.log", "--ledger", W / "ledger_partial.jsonl"],
-             std_ledger=False, reset=False, counts=(0, 24, 0),
-             check=lambda o: expect("台帳で処理済みとしてスキップ 22 件" in o, "台帳スキップ件数の表示なし")),
     Scenario("12", "--restart", [S(), DST, "--restart", "--log", W / "m.log",
                                  "--ledger", W / "ledger_partial.jsonl"], std_ledger=False, counts=(22, 2, 0)),
     Scenario("13", "--move", [S(), DST, "--move"], counts=(22, 2, 0),
-             check=lambda o: (expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
-                                     f"src の残り: {files(SRC)}"),
-                              expect(dirs(SRC) == {"conflict", "data", "data/nested", "data/nested/empty_child",
-                                                   "empty_dir"}, f"src のフォルダの残り: {dirs(SRC)}"),
-                              expect("空になった移行元のフォルダを削除 12 件" in o, "空フォルダの削除の件数"))),
+             check=lambda o: expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
+                                    f"src の残り: {files(SRC)}")),
     Scenario("14", "移行先が移行元の配下", [S(), S("_migrated")], counts=(24, 0, 0)),
     Scenario("14b", "同（別台帳で再実行）", [S(), S("_migrated"), "--log", W / "m.log",
                                        "--ledger", W / "l2.jsonl"], std_ledger=False, reset=False,
@@ -118,33 +106,6 @@ SCENARIOS: list[Scenario] = [
              check=lambda o: expect(read(W / "ab/outB/report.txt") == "b\n", "B がコピーされない")),
     Scenario("19", "大文字小文字違いは同じ移行", ["a", "OUTA"], counts=(0, 1, 0),
              std_ledger=False, cwd=W / "ab", reset=False, windows_only=True),
-    Scenario("20", "コピー（後で --move する前提）", [S(), DST], counts=(22, 2, 0)),
-    Scenario("20b", "コピー済みを --move で片付け", [S(), DST, "--move"], counts=(0, 24, 0), reset=False,
-             check=lambda o: (expect("移行元を削除 22 件" in o, "削除件数の表示なし"),
-                              expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
-                                     f"src の残り: {files(SRC)}"))),
-    Scenario("21", "コピー（台帳なしで --move する前提）", [S(), DST], counts=(22, 2, 0)),
-    Scenario("21b", "台帳なしでも同じ内容なら --move で片付け", [S(), DST, "--move", "--restart"],
-             counts=(0, 24, 0), reset=False,
-             check=lambda o: expect(files(SRC) == {"conflict/same.txt", "conflict/renamed.txt"},
-                                    f"src の残り: {files(SRC)}")),
-
-    # ---------------------------------------------------------------- 重複ファイルの削除
-    Scenario("D1", "--dedupe", [W / "dup/in", W / "dup/out", "--dedupe"], counts=(1, 0, 0),
-             check=lambda o: (expect("重複ファイルの削除: 1 件" in o, "削除件数の表示なし"),
-                              expect(files(W / "dup/out") == {"new.txt", "report.txt", "report (2).txt",
-                                                              "memo (1).txt", "私物/写真.jpg", "私物/写真 (1).jpg"},
-                                     f"out: {files(W / 'dup/out')}"))),
-    Scenario("D2", "--dedupe のドライラン", [W / "dup/in", W / "dup/out", "--dedupe", "--dry-run"],
-             counts=(1, 0, 0),
-             check=lambda o: (expect("DRY-RUN 重複を削除: report (1).txt" in o, "削除予定の表示なし"),
-                              expect((W / "dup/out/report (1).txt").exists(), "ドライランで消えた"))),
-    Scenario("D3", "これからコピーするものもドライランで判定", [W / "dup/in2", W / "dup/new", "--dedupe", "--dry-run"],
-             counts=(2, 0, 0),
-             check=lambda o: (expect("DRY-RUN 重複を削除: a (1).txt" in o, "削除予定の表示なし"),
-                              expect(not (W / "dup/new").exists(), "ドライランで書き込まれた"))),
-    Scenario("D3b", "同（実行）", [W / "dup/in2", W / "dup/new", "--dedupe"], counts=(2, 0, 0), reset=False,
-             check=lambda o: expect(files(W / "dup/new") == {"a.txt"}, f"new: {files(W / 'dup/new')}")),
 
     # ---------------------------------------------------------------- 単一ファイル
     Scenario("S1", "単一ファイルのコピー", [S("docs/議事録_2026年10月.docx"), OUT], counts=(1, 0, 0),
@@ -218,8 +179,6 @@ SCENARIOS: list[Scenario] = [
     Scenario("M13", "引数が 1 つだけ", [S()], exit=2),
     Scenario("M14", "複数のうち 1 つが移行先と同じフォルダ", [S("data/sales.csv"), S("docs/report_2026.PDF"),
                                                   S("docs")], exit=2),
-    Scenario("M15", "バージョンの表示", ["--version"],
-             check=lambda o: expect(re.search(r"FileMove \d+\.\d+\.\d+", o), "バージョンが表示されない")),
 ]
 
 
@@ -229,14 +188,6 @@ def reset() -> None:
     for name, body in (("A", "a\n"), ("B", "b\n")):
         (ab / name).mkdir(parents=True, exist_ok=True)
         (ab / name / "report.txt").write_text(body, encoding="utf-8")
-    # --dedupe 用: out/ 直下は report (1).txt だけが重複（(2) は中身違い、memo (1) は元が無い）。
-    # out/私物/ は今回の移行と関係ないので、重複でも消さない。in2/ は同じ中身の 2 ファイル
-    for rel, body in (("in/new.txt", "new\n"), ("out/report.txt", "same\n"),
-                      ("out/report (1).txt", "same\n"), ("out/report (2).txt", "different\n"),
-                      ("out/memo (1).txt", "orphan\n"), ("out/私物/写真.jpg", "jpg\n"),
-                      ("out/私物/写真 (1).jpg", "jpg\n"), ("in2/a.txt", "same\n"), ("in2/a (1).txt", "same\n")):
-        (W / "dup" / rel).parent.mkdir(parents=True, exist_ok=True)
-        (W / "dup" / rel).write_text(body, encoding="utf-8")
 
 
 def run(sc: Scenario) -> tuple[bool, str]:
