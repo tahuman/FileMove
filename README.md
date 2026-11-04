@@ -55,7 +55,7 @@ python migrate_files.py 移行元 [移行元 ...] 移行先             # 実行
 | GUI を Python から使う | `python -m pip install -r requirements.txt`（見た目の sv-ttk・ドラッグ＆ドロップの tkinterdnd2。無くても動く） |
 | exe を作る | `python tools/build_exe.py`（`dist\FileMove.exe`。`dist/` は git に入れない。自己署名の証明書で署名し、作った後に自己診断も行う。PyInstaller が必要） |
 | テスト（本体・CLI・GUI・ユースケース・シナリオ） | `python -m pip install -r requirements-dev.txt` の後に `python -m pytest` |
-| リリース前の確認 | [docs/gui/USECASES.md](docs/gui/USECASES.md)（ユースケースのテストの一覧と、人が手で確かめること） |
+| リリースの手順 | [RELEASE.md](RELEASE.md)（テスト・人の確認・マージ・タグ・配布の順。人の確認は [docs/gui/USECASES.md](docs/gui/USECASES.md)） |
 | CLI のデモを動かす | `python demo/cli/demo.py`（`--auto` で止まらずに流す、`--only 3` で P3 だけ） |
 | CLI のデモの GIF を作り直す | `python demo/cli/make_gif.py`（`docs/images/cli/` に出力。Pillow が必要） |
 | GUI のデモを見る | `python demo/gui/demo_gui.py --show 2`（G2 を画面で再生） |
