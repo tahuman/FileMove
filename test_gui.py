@@ -628,17 +628,19 @@ def test_W14_app_many_files(tk_root, tmp_path):
     assert time.time() - start < 120
 
 
-@pytest.mark.parametrize("fails, can_drop", [(1, True), (3, False)])
-def test_W15_make_root_retries_tkdnd(tk_root, tmp_path, monkeypatch, fails, can_drop):
+@pytest.mark.parametrize("fails", [1, 3])
+def test_W15_make_root_retries_tkdnd(tk_root, tmp_path, monkeypatch, fails):
     TkinterDnD = pytest.importorskip("tkinterdnd2").TkinterDnD
     import gui.app as ga
-    real, calls = TkinterDnD._require, []
+    calls = []
 
     def flaky(root):
+        # 本物の読み込みはしない（テストのプロセスには Tk が 2 つあり、本物の読み込みがまれに失敗するため。
+        # 本物の読み込みは W11 と exe の X1 で確かめる）
         calls.append(root)
         if len(calls) <= fails:
             raise RuntimeError("Unable to load tkdnd library.")
-        return real(root)
+        return "2.10.3"
 
     monkeypatch.setattr(TkinterDnD, "_require", flaky)
     monkeypatch.setattr(ga, "time", SimpleNamespace(sleep=lambda s: None))
@@ -646,7 +648,10 @@ def test_W15_make_root_retries_tkdnd(tk_root, tmp_path, monkeypatch, fails, can_
     try:
         root.withdraw()
         assert len(calls) == min(fails + 1, 3) and all(c is root for c in calls)   # 同じ窓のままやり直す
-        assert _make_app(root, tmp_path).can_drop is can_drop
+        if fails < 3:
+            assert root.TkdndVersion == "2.10.3"                                  # やり直して読み込めた
+        else:
+            assert _make_app(root, tmp_path).can_drop is False                    # 窓はそのまま、D&D 無しで動く
     finally:
         root.destroy()
 

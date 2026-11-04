@@ -19,13 +19,14 @@
 
 ### 2. 自動のテストと exe
 
-- [ ] `python -m pytest` が全件成功する（本体・CLI・GUI・ユースケース・シナリオ）
-- [ ] `python tools/build_exe.py` で exe を作り直し、署名と自己診断が通る（`test_gui.py` の X1〜X3 も）
+- [x] `python -m pytest` が全件成功する（本体・CLI・GUI・ユースケース・シナリオ）
+- [x] `python tools/build_exe.py` で exe を作り直し、署名と自己診断が通る（`test_gui.py` の X1〜X3 も）
 
 ### 3. 人が確かめる
 
-- [ ] `docs/gui/USECASES.md` の「2. 人が確かめること」をすべて行う
-- [ ] 見つかった問題は `fix.md` に書き、このリリースで直すかを決める。直したら 2 からやり直す
+- [〇] `docs/gui/USECASES.md` の「2. 人が確かめること」をすべて行う
+- [〇] 見つかった問題は `fix.md` に書き、このリリースで直すかを決める。直したら 2 からやり直す
+> USECASES.mdにコメント済み
 
 ### 4. マージ
 
