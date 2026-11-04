@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 import tkinter as tk
 import traceback
 from datetime import datetime
@@ -115,7 +116,7 @@ class App:
         self._dest_dir: Path | None = None
         self._closing = False
 
-        root.title("FileMove")
+        root.title(f"FileMove {mf.__version__}")
         setup_fonts(root)
         self.bg = ttk.Style(root).lookup("TFrame", "background") or "#fafafa"
         self._build()
@@ -659,13 +660,26 @@ def dpi_aware() -> None:
         pass
 
 
-def make_root() -> tk.Tk:
-    """ドラッグ＆ドロップ（tkinterdnd2）が使えればそのウィンドウを、無ければ普通のウィンドウを作る。"""
+def make_root(attempts: int = 3) -> tk.Tk:
+    """ドラッグ＆ドロップ（tkinterdnd2）が使えればそのウィンドウを、無ければ普通のウィンドウを作る。
+
+    tkdnd の読み込みはまれに失敗する（exe が展開した直後のファイルをウイルス対策ソフトが調べている間など）ので、
+    数回やり直す。それでも駄目なら同じウィンドウのまま、ドラッグ＆ドロップ無しで使う（余分な窓を残さない）。
+    """
     try:
         from tkinterdnd2 import TkinterDnD
-        return TkinterDnD.Tk()
     except Exception:
         return tk.Tk()
+    root = TkinterDnD.Tk.__new__(TkinterDnD.Tk)
+    tk.Tk.__init__(root)                     # TkinterDnD.Tk() と同じ。読み込みだけを下でやり直せるように分ける
+    for i in range(attempts):
+        try:
+            root.TkdndVersion = TkinterDnD._require(root)
+            break
+        except Exception:
+            if i + 1 < attempts:
+                time.sleep(0.3)
+    return root
 
 
 def self_test(out: Path | None = None) -> int:
@@ -674,8 +688,7 @@ def self_test(out: Path | None = None) -> int:
     0 なら正常。結果は out（省略時は %LOCALAPPDATA%\\FileMove\\self_test.txt）に書く。
     """
     import tempfile
-    import time
-    lines, ok = [], True
+    lines, ok = [f"FileMove {mf.__version__}"], True
 
     def check(name: str, cond: bool) -> None:
         nonlocal ok

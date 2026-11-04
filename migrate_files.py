@@ -41,6 +41,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
+__version__ = "1.0.0"   # CLI の --version・GUI のタイトル・exe のプロパティに出す
+
 CHUNK_SIZE = 1024 * 1024  # 1MB
 LOGGER = logging.getLogger("migrate")
 
@@ -836,6 +838,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="転送後、今回ファイルを置いた移行先のフォルダで `name (1).ext` のような"
                         "番号付きファイルが番号なしのものと同じ内容なら削除する")
     p.add_argument("--dry-run", action="store_true", help="書き込まずに対象だけ表示する")
+    p.add_argument("--version", action="version", version=f"FileMove {__version__}",
+                   help="バージョンを表示して終わる")
     p.add_argument("--on-exists", choices=["skip", "overwrite", "rename"], default="skip",
                    help="移行先に同名ファイルがある場合の動作（既定: skip）。"
                         "rename でも中身が同じならスキップする")

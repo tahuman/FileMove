@@ -218,6 +218,8 @@ SCENARIOS: list[Scenario] = [
     Scenario("M13", "引数が 1 つだけ", [S()], exit=2),
     Scenario("M14", "複数のうち 1 つが移行先と同じフォルダ", [S("data/sales.csv"), S("docs/report_2026.PDF"),
                                                   S("docs")], exit=2),
+    Scenario("M15", "バージョンの表示", ["--version"],
+             check=lambda o: expect(re.search(r"FileMove \d+\.\d+\.\d+", o), "バージョンが表示されない")),
 ]
 
 

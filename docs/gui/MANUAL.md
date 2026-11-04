@@ -19,7 +19,7 @@ FileMove は、フォルダにたまったファイルを、フォルダの構�
 
 | 方法 | 手順 |
 |---|---|
-| exe（おすすめ） | `FileMove.exe` をダブルクリック。Python は要りません |
+| exe（おすすめ） | `FileMove.exe` をダブルクリック。Python は要りません。exe は GitHub の Releases から入手します（リポジトリには入っていません） |
 | Python から | `python -m pip install -r requirements.txt` を一度だけ実行した後、`gui\FileMove.pyw` をダブルクリック（または FileMove のフォルダで `python -m gui`） |
 
 - 今のところ Windows 向けです（Mac・Linux は今後対応予定）

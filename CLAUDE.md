@@ -9,6 +9,7 @@
 | `migrate_files.py` | 処理の本体（`run_migration()` など）と CLI |
 | `gui/` | GUI（tkinter）。`runner.py` が入力の確認と別スレッドでの実行、`app.py` が画面 |
 | `test_migrate_files.py` / `test_gui.py` | 本体と CLI のテスト / GUI のテスト |
+| `test_usecases.py` | ユースケースのテスト（システムテスト）。GUI を人と同じ順に操作して、ファイル・画面・保存した結果まで確かめる。一覧と「人が確かめること」は `docs/gui/USECASES.md` |
 | `testdata/` | CLI のシナリオ（`SCENARIOS.md` と `run_scenarios.py`） |
 | `demo/` | デモ。`sample.py` が共通のサンプル、`cli/` が CLI、`gui/` が GUI |
 | `docs/cli/` / `docs/gui/` | CLI / GUI のマニュアル |
@@ -22,15 +23,19 @@
 - 機能の追加・変更・バグ修正をしたら、同じ作業の中でテストも追加・更新する。実装だけ・テストだけで終わらせない
 - 本体と CLI の単体テストは `test_migrate_files.py`、GUI のテストは `test_gui.py` に書き、それぞれ冒頭の「テスト網羅」に項目（ID と一文の説明）を足す
 - CLI から見た振る舞いが変わる場合は、`testdata/SCENARIOS.md` の表と `testdata/run_scenarios.py` の `SCENARIOS` も揃えて更新する
+- GUI の使い方（操作の流れ・結果の出し方）が変わる場合は、`test_usecases.py` と `docs/gui/USECASES.md` の表も揃えて更新する
+- 頼まれた作業の外で見つけた不具合は、勝手に直さず `fix.md` に書いて知らせる（直すかは人が決める）。テストで示すなら `xfail(strict=True)` にして fix.md の番号を書く
+- リリースの前には `docs/gui/USECASES.md` の「人が確かめること」を人が行う。リリースの手順と進み具合は `RELEASE.md`
 - 作業の最後に `python -m pytest` を実行し、全件成功を確認してから報告する。失敗が残る場合はその出力を添えて報告する
 
 ## テストの実行
 
 ```
 python -m pip install -r requirements-dev.txt
-python -m pytest                    # 全件（本体・CLI・GUI・シナリオ、40 秒ほど）
+python -m pytest                    # 全件（本体・CLI・GUI・ユースケース・シナリオ、1 分ほど）
 python -m pytest -m "not scenario"  # シナリオ以外
 python -m pytest test_gui.py        # GUI だけ
+python -m pytest test_usecases.py   # ユースケースだけ
 ```
 
 ## テストの書き方
@@ -62,3 +67,4 @@ python -m pytest test_gui.py        # GUI だけ
 
 - `plan.md` は今後の機能・課題の一覧。終わったものは「完了」の表に移す。デモのように更新し続けるものは「継続」に置き、完了には移さない
 - `fix.md` は見つけた不具合・指摘の一覧。直したら `plan.md` の「修正（完了）」に移す
+- `RELEASE.md` はリリースの手順（チェックリスト）と履歴。リリースの作業が進んだらチェックを付ける

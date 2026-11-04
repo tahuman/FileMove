@@ -22,7 +22,8 @@ exe のテスト（X）は、dist/FileMove.exe があるときだけ動かす（
   結果の見せ方と保存（gui/runner.py の describe / dedupe_rows / outcome / save_report）
     - [U7] 進捗の通知を一覧の行（状態・保存先・理由・色）にする。移動／コピー、確認、
            処理済み・同名でスキップ・エラー・重複の削除をそれぞれ区別する
-    - [U8] 結果の見出し: 完了・確認・スキップあり・エラーあり・中止・対象なしを、色（level）と文言で分ける
+    - [U8] 結果の見出し: 完了・確認・スキップあり・エラーあり・中止・対象なしを、色（level）と文言で分ける。
+           確認で全部が同名のためスキップになるときは、「ありません」ではなくスキップの理由を出す（F30）
     - [U9] 結果の一覧（BOM 付き CSV。Excel で開ける）とログを日時の名前で保存する。同じ秒なら _2 を付ける
   画面（gui/app.py）
     - [W1] 対象フォルダを追加（同じもの 1 回・ファイルは追加しない）・外す、保存先フォルダを入れて、確認 → 実行で
@@ -42,15 +43,19 @@ exe のテスト（X）は、dist/FileMove.exe があるときだけ動かす（
     - [W8] 実行するのは確認した一覧のファイルだけ。確認の後に増えたファイルは移さない
     - [W9] 結果を保存できなくても、移動の結果はそのまま出し、保存できなかったことを知らせる
     - [W10] 画面の処理で想定外のエラーが起きても落ちず、見出しに出して error.log に記録する
-    - [W11] 自己診断（self_test。exe の確認用）が、確認 → 実行まで通って 0 を返す
+    - [W11] 自己診断（self_test。exe の確認用）が、確認 → 実行まで通って 0 を返す。1 行目にバージョンを書き、窓のタイトルにもバージョンが出る
     - [W13] desktop.ini・Office の一時ファイル・ダウンロード途中のファイルは、一覧にも出さず移さない。
            それだけが残ったフォルダは空とみなして対象フォルダの一覧から外す
     - [W14] 500 件（30 フォルダ）でも、確認 → 実行が固まらずに終わり、一覧・保存した結果も 500 件そろう
+    - [W15] ドラッグ＆ドロップ（tkdnd）の読み込みに失敗しても数回やり直し、それでも駄目なら窓は 1 つのまま
+           ドラッグ＆ドロップ無しで動く
   GUI のデモ（demo/gui/demo_gui.py）
     - [W12] 全パターン（G1〜G6）を録画せずに動かし、それぞれ期待どおりのファイルの状態になる
+    - [W16] 撮影した画面に、タイトルバー・説明の帯を付け、まわりを黒い枠で囲む（README の白い背景と区別する）
   exe（tools/build_exe.py で作った dist/FileMove.exe）
     - [X1] exe の自己診断（--self-test）が正常に終わる（見た目・ドラッグ＆ドロップのライブラリも入っている）
     - [X2] exe に自己署名の証明書（CN=FileMove (self-signed)）で署名されていて、署名の後に書き換わっていない
+    - [X3] exe のファイルのプロパティ（製品名・バージョン）と自己診断の 1 行目が、本体の __version__ と一致する
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,6 +245,8 @@ def test_U7_dedupe_rows(tmp_path):
     (dict(copied=3, skipped=1), dict(move=True, dry_run=True, kept=1), "info",
      "確認: 3 件を移動します（まだ何も変えていません）", "1 件は保存先に同名の別ファイルがあるためスキップします"),
     (dict(), dict(move=True, dry_run=True), "info", "移動するファイルはありません", "すべて処理済み"),
+    (dict(skipped=2), dict(move=True, dry_run=True, kept=2), "warn",
+     "2 件は保存先に同名の別ファイルがあるためスキップします", "「連番を付けて保存」"),
     (dict(copied=2, skipped=1), dict(move=True, kept=1), "warn",
      "2 件を移動しました。1 件はスキップしました", "「連番を付けて保存」"),
     (dict(copied=2, failed=1), dict(move=True), "error", "1 件でエラーが起きました", "赤い行"),
@@ -572,7 +580,9 @@ def test_W11_self_test(tk_root, tmp_path):
     out = tmp_path / "self_test.txt"
 
     assert self_test(out) == 0, out.read_text(encoding="utf-8")
-    assert out.read_text(encoding="utf-8").endswith("結果: 正常\n")
+    text = out.read_text(encoding="utf-8")
+    assert text.startswith(f"FileMove {mf.__version__}\n") and text.endswith("結果: 正常\n")
+    assert _make_app(tk_root, tmp_path).root.title() == f"FileMove {mf.__version__}"
 
 
 def test_W13_app_keeps_system_files(tk_root, downloads, tmp_path):
@@ -618,6 +628,34 @@ def test_W14_app_many_files(tk_root, tmp_path):
     assert time.time() - start < 120
 
 
+@pytest.mark.parametrize("fails", [1, 3])
+def test_W15_make_root_retries_tkdnd(tk_root, tmp_path, monkeypatch, fails):
+    TkinterDnD = pytest.importorskip("tkinterdnd2").TkinterDnD
+    import gui.app as ga
+    calls = []
+
+    def flaky(root):
+        # 本物の読み込みはしない（テストのプロセスには Tk が 2 つあり、本物の読み込みがまれに失敗するため。
+        # 本物の読み込みは W11 と exe の X1 で確かめる）
+        calls.append(root)
+        if len(calls) <= fails:
+            raise RuntimeError("Unable to load tkdnd library.")
+        return "2.10.3"
+
+    monkeypatch.setattr(TkinterDnD, "_require", flaky)
+    monkeypatch.setattr(ga, "time", SimpleNamespace(sleep=lambda s: None))
+    root = ga.make_root()
+    try:
+        root.withdraw()
+        assert len(calls) == min(fails + 1, 3) and all(c is root for c in calls)   # 同じ窓のままやり直す
+        if fails < 3:
+            assert root.TkdndVersion == "2.10.3"                                  # やり直して読み込めた
+        else:
+            assert _make_app(root, tmp_path).can_drop is False                    # 窓はそのまま、D&D 無しで動く
+    finally:
+        root.destroy()
+
+
 # ================================================================ GUI のデモ
 
 def _names(d: Path) -> list[str]:
@@ -641,12 +679,7 @@ DEMO_EXPECTED = {   # パターン -> (確かめるフォルダ（ホームか�
 
 
 def test_W12_gui_demo_patterns(tk_root, tmp_path):
-    import importlib.util
-    import sys
-    spec = importlib.util.spec_from_file_location("demo_gui", ROOT / "demo/gui/demo_gui.py")
-    demo_gui = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = demo_gui
-    spec.loader.exec_module(demo_gui)
+    demo_gui = _load_demo_gui()
     assert len(demo_gui.PATTERNS) == len(DEMO_EXPECTED)
 
     for i, checks in DEMO_EXPECTED.items():
@@ -656,6 +689,31 @@ def test_W12_gui_demo_patterns(tk_root, tmp_path):
         for where, expected in checks:
             folder = sample.d_drive / where[3:] if where.startswith("D:/") else sample.home / where
             assert _names(folder) == expected, f"G{i} {where}"
+
+
+def _load_demo_gui():
+    import importlib.util
+    import sys
+    spec = importlib.util.spec_from_file_location("demo_gui", ROOT / "demo/gui/demo_gui.py")
+    demo_gui = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = demo_gui
+    spec.loader.exec_module(demo_gui)
+    return demo_gui
+
+
+def test_W16_gui_demo_frame(tk_root):
+    Image = pytest.importorskip("PIL.Image")
+    demo_gui = _load_demo_gui()
+    window = Image.new("RGB", (300, 200), (250, 250, 250))   # 白っぽい画面
+
+    img = demo_gui.compose(window, "やりたいこと", "していること", pointer=(10, 10))
+
+    b = demo_gui.FRAME_PX
+    assert b >= 4 and img.size == (300 + 2 * b, 34 + 200 + 64 + 2 * b)   # タイトルバー・説明の帯・枠の分だけ大きい
+    w, h = img.size
+    for x, y in [(0, 0), (w // 2, b - 1), (w // 2, h - 1), (0, h // 2), (w - 1, h // 2)]:
+        assert img.getpixel((x, y)) == (0, 0, 0), (x, y)           # 上下左右が黒い枠
+    assert img.getpixel((b + 150, b + 34 + 100)) == (250, 250, 250)  # 中は画面のまま
 
 
 # ================================================================ exe
@@ -671,6 +729,7 @@ def test_X1_exe_self_test(tmp_path):
 
     text = out.read_text(encoding="utf-8")
     assert proc.returncode == 0, text
+    assert text.startswith(f"FileMove {mf.__version__}\n")
     assert "OK  見た目（sv-ttk）" in text and "OK  ドラッグ＆ドロップ（tkinterdnd2）" in text
     assert text.endswith("結果: 正常\n")
 
@@ -687,3 +746,12 @@ def test_X2_exe_signed():
     # 自己署名なので「信頼されていないルート」（UnknownError）か、この PC で信頼していれば Valid。
     # 署名の後に書き換わっていたら HashMismatch、署名が無ければ NotSigned になる
     assert status in ("Valid", "UnknownError"), status
+
+
+@pytest.mark.skipif(not EXE.exists(), reason="dist/FileMove.exe が無い（python tools/build_exe.py で作る）")
+def test_X3_exe_version():
+    script = f"$v = (Get-Item '{EXE}').VersionInfo; $v.ProductName; $v.ProductVersion; $v.FileVersion"
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                         capture_output=True, text=True, timeout=60).stdout.split()
+
+    assert out == ["FileMove", mf.__version__, mf.__version__ + ".0"]

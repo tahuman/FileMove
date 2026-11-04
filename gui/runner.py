@@ -257,6 +257,11 @@ def outcome(result: mf.MigrationResult, *, dry_run: bool, move: bool, kept: int 
                        f"{done} 件を{verb}したところで止めました。もう一度「確認」から行うと、続きから処理します。")
     if dry_run:
         if not done and not (result.dedupe and result.dedupe.removed):
+            if kept:   # 全部が同名のためスキップになる
+                return Outcome("warn", f"{kept} 件は保存先に同名の別ファイルがあるためスキップします",
+                               f"{verb}するファイルはありません。両方残すには「同名ファイルの処理」を"
+                               "「連番を付けて保存」に、保存先のものを置き換えるには「上書き」にして、"
+                               "もう一度「確認」を押してください。")
             return Outcome("info", f"{verb}するファイルはありません",
                            "対象フォルダが空か、種類・期間の条件に合うファイルがないか、すべて処理済みです。")
         kept_note = f"{kept} 件は保存先に同名の別ファイルがあるためスキップします。" if kept else ""
