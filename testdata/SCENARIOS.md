@@ -53,7 +53,7 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 
 ## シナリオと期待結果
 
-（2026-10-13 時点の実装で全件確認済み。18・19 は一時ディレクトリで実施）
+（2026-10-20 時点の実装で全件確認済み。18・19 は一時ディレクトリで実施）
 
 | # | コマンド（追加引数） | 期待結果 |
 |---|---|---|
@@ -67,15 +67,18 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | 8 | 7 の直後に同じコマンドを再実行 | 成功 0・スキップ 24、「うち台帳で処理済みとしてスキップ 22 件」と表示 |
 | 9 | `--on-exists rename` | 成功 24。`same_1.txt` と `renamed_2.txt`（_1 は既存のため）が `NEW (src)` で作られる |
 | 10 | `--on-exists overwrite` | 成功 24。`same.txt` が `NEW (src)` に置き換わる |
-| 11 | `--ledger $W/ledger_partial.jsonl` | 成功 20・スキップ 4（done の 2 件＋衝突 2 件）、「うち台帳で処理済み 2 件」。failed/skipped 記録の sales.xlsx・photo1.jpg、別の移行・旧形式の記録しかない empty_file.txt・no_extension・archive.tar.gz はコピーされる。壊れた行でエラーにならない |
+| 11 | `--ledger $W/ledger_partial.jsonl` | 成功 22・スキップ 2（衝突 2 件）。done の記録がある report_2025.pdf・sales.csv は、移行先に見当たらないので「転送し直します」と表示してコピーする。failed/skipped 記録の sales.xlsx・photo1.jpg、別の移行・旧形式の記録しかない empty_file.txt・no_extension・archive.tar.gz もコピーされる。壊れた行でエラーにならない |
+| 11b | 11 の直後に同じコマンドを再実行 | 成功 0・スキップ 24、「うち台帳で処理済みとしてスキップ 22 件」 |
 | 12 | `--restart --ledger $W/ledger_partial.jsonl` | 台帳を無視して 1 と同じく成功 22・スキップ 2 |
-| 13 | `--move` | 成功 22・スキップ 2。src に残るのは conflict/same.txt と conflict/renamed.txt のみ |
+| 13 | `--move` | 成功 22・スキップ 2。src に残るのは conflict/same.txt と conflict/renamed.txt のみ。空になったフォルダは消え（「空になった移行元のフォルダを削除 12 件」）、残るのは conflict/・data/nested/（もともと空の empty_child/ がある）・empty_dir/ |
 | 14 | dst を `$W/src/_migrated` にする（2 回実行、2 回目は別台帳） | 1 回目 成功 24。2 回目も対象 24 件のまま（_migrated 配下を辿らない）でスキップ 24 |
 | 15 | 7 の後に src と dst の更新日時を比較 | 一致（copy2 でメタデータ保持） |
 | 16 | src と dst に同じパスを指定 | 「移行元と移行先が同じです」/ exit 2 |
 | 17 | src に存在しないパスを指定 | 「移行元が見つかりません」/ exit 2 |
 | 18 | 既定の台帳のまま `A→outA`、続けて `B→outB`（どちらにも `report.txt`） | 2 回とも成功 1。B のファイルが台帳のせいでスキップされない |
 | 19 | 18 の後に `a→OUTA`（大文字小文字だけ違うパス、Windows） | 同じ移行とみなし、台帳で処理済みとしてスキップ 1 |
+| 20 | 7 の直後に `--move` | 成功 0・スキップ 24、「うち移行先に同じ内容があるため移行元を削除 22 件」。src に残るのは conflict/same.txt と conflict/renamed.txt のみ（中身が違うため） |
+| 21 | 7 の直後に `--move --restart`（台帳を使わない） | 20 と同じ。移行先に同じ内容があるかで判定する |
 
 ## 単一ファイル指定
 
@@ -98,10 +101,6 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | S15 | 存在しないファイルを指定 | 「移行元が見つかりません」/ exit 2 |
 | S16 | `docs/` に移動して相対パス `"meeting notes.txt"` を指定 | 成功 1 |
 
-<<<<<<< HEAD
-=======
-<<<<<<< HEAD
->>>>>>> 9053625469c8fd1bfe65ca7dd9131984813d90cc
 ## 複数指定
 
 `SRC [SRC ...] DST` の形で、最後の引数が移行先。ディレクトリ・ファイル・ワイルドカードを混ぜて指定できる。
@@ -124,7 +123,6 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | M12 | M1 に `--ext pdf` | 成功 1 |
 | M13 | 引数が 1 つだけ | 使い方エラー / exit 2 |
 | M14 | 移行先を `src/docs` にして `docs/report_2026.PDF` を含める | 「移行元と移行先が同じです」/ exit 2 |
-<<<<<<< HEAD
 | M15 | `--version`（移行元・移行先なし） | 「FileMove 1.0.0」と表示 / exit 0 |
 
 ## 重複ファイルの削除（--dedupe）
@@ -143,11 +141,6 @@ src は計 **24 ファイル**。dst には `conflict/same.txt`, `conflict/renam
 | D3 | `$W/dup/in2 $W/dup/new --dedupe --dry-run`（移行先はまだ無い） | これからコピーする 2 ファイルも含めて判定し、「DRY-RUN 重複を削除: a (1).txt」と表示する。`new/` は作られない |
 | D3b | D3 から `--dry-run` を外して実行 | 成功 2 の後に `a (1).txt` が消え、`new/` には `a.txt` だけが残る（ドライランの表示と一致） |
 
-=======
-
-=======
->>>>>>> a67ccabaa807a776249a43fd0f2d9e4769695bdd
->>>>>>> 9053625469c8fd1bfe65ca7dd9131984813d90cc
 ## このデータでは確認できないもの
 
 - ハッシュ不一致・コピー途中の失敗（`.part` が残らないこと）、Ctrl+C 中断 → `copy_fn` を差し替えるユニットテスト向き
